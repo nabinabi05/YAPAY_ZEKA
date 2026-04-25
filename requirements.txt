@@ -1,0 +1,25 @@
+# PyTorch ecosystem
+torch
+torchvision
+torchaudio
+
+# Computer Vision & Image Processing
+opencv-python
+Pillow
+scikit-image
+
+# Data Processing & Math
+numpy
+pandas
+scipy
+
+# Visualization
+matplotlib
+seaborn
+
+# Machine Learning utilities
+scikit-learn
+
+# Utilities
+tqdm
+jupyter

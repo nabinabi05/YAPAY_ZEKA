@@ -1,0 +1,13 @@
+*.pth
+data/
+__pycache__/
+*.png
+results.json
+checkpoints/
+.DS_Store
+.venv/
+env/
+venv/
+node_modules/
+dist/
+build/

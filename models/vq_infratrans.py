@@ -349,7 +349,7 @@ class VQInfraTrans(nn.Module):
     """
 
     def __init__(self, input_nc: int = 1, output_nc: int = 3,
-                 latent_dim: int = 256, vq_codes: int = 1024,
+                 latent_dim: int = 256, vq_codes: int = 256,
                  transformer_depth: int = 6, transformer_pool: int = 2):
         super().__init__()
         self.backbone            = CNNBackbone(in_channels=input_nc, dim=latent_dim)

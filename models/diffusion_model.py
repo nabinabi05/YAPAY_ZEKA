@@ -255,7 +255,7 @@ class ThermalToVisibleDDPM(nn.Module):
     def __init__(self, network: nn.Module,
                  beta_1: float = 1e-4,
                  beta_T: float = 0.02,
-                 T: int = 1000,
+                 T: int = 500,
                  schedule: str = 'cosine'):
         super().__init__()
         self.network = network

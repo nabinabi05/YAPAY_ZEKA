@@ -78,10 +78,10 @@ class MambaTranslatorProxy(nn.Module):
         # Decoder with skip connections
         self.dec1 = nn.Sequential(
             nn.ConvTranspose2d(512, 128, 4, stride=2, padding=1, bias=False),
-            nn.InstanceNorm2d(128, affine=True), nn.SiLU())
+            nn.InstanceNorm2d(128, affine=True), nn.SiLU(), nn.Dropout(0.1))
         self.dec2 = nn.Sequential(
             nn.ConvTranspose2d(256, 64, 4, stride=2, padding=1, bias=False),
-            nn.InstanceNorm2d(64, affine=True), nn.SiLU())
+            nn.InstanceNorm2d(64, affine=True), nn.SiLU(), nn.Dropout(0.1))
         self.out = nn.Sequential(
             nn.Conv2d(128, 3, 3, padding=1), nn.Tanh())
 
@@ -173,7 +173,7 @@ class UnifiedModelTrainer:
 
         elif self.model_name == "Cond-DDPM":
             unet       = ConditionalUNet(c_in=4, c_out=3)
-            self.model = ThermalToVisibleDDPM(network=unet, T=1000, schedule='cosine').to(self.device)
+            self.model = ThermalToVisibleDDPM(network=unet, T=500, schedule='cosine').to(self.device)
             self.opts['main']   = optim.Adam(self.model.parameters(), lr=2e-4)
             self.base_criterion = nn.MSELoss()
 

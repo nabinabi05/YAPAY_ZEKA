@@ -173,8 +173,8 @@ class UnifiedModelTrainer:
 
         elif self.model_name == "Cond-DDPM":
             unet       = ConditionalUNet(c_in=4, c_out=3)
-            self.model = ThermalToVisibleDDPM(network=unet, T=500, schedule='cosine').to(self.device)
-            self.opts['main']   = optim.Adam(self.model.parameters(), lr=2e-4)
+            self.model = ThermalToVisibleDDPM(network=unet, T=1000, schedule='cosine').to(self.device)
+            self.opts['main']   = optim.Adam(self.model.parameters(), lr=1e-4)
             self.base_criterion = nn.MSELoss()
 
         elif self.model_name == "FWGAN":
@@ -579,11 +579,11 @@ if __name__ == '__main__':
         benchmark_results = {}
 
     model_configs = {
-        "DCNet":         {"batch_size": 32,  "epochs": 5},
-        "FWGAN":         {"batch_size": 128, "epochs": 5},
-        "VQ-InfraTrans": {"batch_size": 120, "epochs": 5},
-        "Inter-Mamba":   {"batch_size": 32,  "epochs": 5},
-        "Cond-DDPM":     {"batch_size": 64,  "epochs": 5},
+        "DCNet":         {"batch_size": 32,  "epochs": 50},
+        "FWGAN":         {"batch_size": 128, "epochs": 50},
+        "VQ-InfraTrans": {"batch_size": 120, "epochs": 30},
+        "Inter-Mamba":   {"batch_size": 32,  "epochs": 30},
+        "Cond-DDPM":     {"batch_size": 64,  "epochs": 50},
     }
 
     for model_name, config in model_configs.items():

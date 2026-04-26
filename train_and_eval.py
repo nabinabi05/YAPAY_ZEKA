@@ -579,14 +579,14 @@ if __name__ == '__main__':
         benchmark_results = {}
 
     model_configs = {
-        "DCNet":         {"batch_size": 32, "epochs": 5},
+        "DCNet":         {"batch_size": 32,  "epochs": 5},
         "FWGAN":         {"batch_size": 128, "epochs": 5},
         "VQ-InfraTrans": {"batch_size": 120, "epochs": 5},
         "Inter-Mamba":   {"batch_size": 32,  "epochs": 5},
-        "FWGAN":         {"batch_size": 128, "epochs": 5},
-        "VQ-InfraTrans": {"batch_size": 120, "epochs": 5},
-        "Inter-Mamba":   {"batch_size": 32,  "epochs": 5},
-        "Cond-DDPM":     {"batch_size": 64, items():
+        "Cond-DDPM":     {"batch_size": 64,  "epochs": 5},
+    }
+
+    for model_name, config in model_configs.items():
         ckpt_path = os.path.join(CKPT_DIR, f"{model_name}_final.pth")
 
         trainer = UnifiedModelTrainer(

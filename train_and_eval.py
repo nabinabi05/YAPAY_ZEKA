@@ -14,6 +14,7 @@ torch.backends.cudnn.deterministic = False
 
 from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
+from torchvision.utils import make_grid, save_image
 
 from data.dataset import create_dataloader
 from models.dc_net import DCNet
@@ -21,6 +22,25 @@ from models.diffusion_model import ThermalToVisibleDDPM, ConditionalUNet
 from models.fwgan import FWGANArchive
 from models.vq_infratrans import VQInfraTrans
 from models.mamba_fusion import InterMambaBlock
+
+
+class ReplayBuffer:
+    def __init__(self, max_size=50):
+        self.max_size = max_size
+        self.data = []
+    def push_and_pop(self, batch):
+        result = []
+        for elem in batch:
+            if len(self.data) < self.max_size:
+                self.data.append(elem)
+                result.append(elem)
+            elif np.random.rand() > 0.5:
+                idx = np.random.randint(0, self.max_size)
+                result.append(self.data[idx].clone())
+                self.data[idx] = elem
+            else:
+                result.append(elem)
+        return torch.stack(result)
 
 
 # --------------------------------------------------------------------------- #
@@ -153,20 +173,22 @@ class UnifiedModelTrainer:
 
         elif self.model_name == "Cond-DDPM":
             unet       = ConditionalUNet(c_in=4, c_out=3)
-            self.model = ThermalToVisibleDDPM(network=unet, T=1000).to(self.device)
+            self.model = ThermalToVisibleDDPM(network=unet, T=1000, schedule='cosine').to(self.device)
             self.opts['main']   = optim.Adam(self.model.parameters(), lr=2e-4)
             self.base_criterion = nn.MSELoss()
 
         elif self.model_name == "FWGAN":
             self.model = FWGANArchive(input_nc=1, output_nc=3).to(self.device)
+            self.model.lambda_temp = 0.0  # ADD THIS LINE — disables temporal loss
             self.opts['gen']  = optim.Adam(
-                self.model.generator.parameters(),     lr=2e-4, betas=GAN_BETAS)
+                self.model.generator.parameters(),     lr=2e-4, betas=(0.5, 0.999))
             self.opts['disc'] = optim.Adam(
-                self.model.discriminator.parameters(), lr=1e-4, betas=GAN_BETAS)  # TTUR
+                self.model.discriminator.parameters(), lr=1e-4, betas=(0.5, 0.999))  # TTUR
+            self.fake_buffer = ReplayBuffer(max_size=50)
 
         elif self.model_name == "VQ-InfraTrans":
             self.model = VQInfraTrans(input_nc=1, output_nc=3).to(self.device)
-            self.opts['main']   = optim.Adam(self.model.parameters(), lr=2e-4)
+            self.opts['main']   = optim.Adam(self.model.parameters(), lr=1e-4, betas=(0.5, 0.999))
             self.base_criterion = nn.L1Loss()
 
         elif self.model_name == "Inter-Mamba":
@@ -180,19 +202,16 @@ class UnifiedModelTrainer:
         for key in self.opts:
             self.scalers[key] = GradScaler('cuda', enabled=self.use_amp)
 
-        steps_per_epoch = len(self.train_loader)
-        total_steps     = self.epochs * steps_per_epoch
-        warmup_steps    = max(1, total_steps // 10)
-
-        self.schedulers  = {}
+        self.schedulers = {}
         self._step_count = 0
-
+        steps_per_epoch = len(self.train_loader)
+        total_steps = self.epochs * steps_per_epoch
         for key, opt in self.opts.items():
-            def lr_lambda(step, ws=warmup_steps, ts=total_steps):
-                if step < ws:
-                    return step / ws
-                progress = (step - ws) / max(1, ts - ws)
-                return 0.5 * (1.0 + np.cos(np.pi * progress))
+            def lr_lambda(step, ts=total_steps):
+                decay_start = ts // 2
+                if step < decay_start:
+                    return 1.0
+                return max(0.0, 1.0 - (step - decay_start) / (ts - decay_start))
             self.schedulers[key] = optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_lambda)
 
     def load_checkpoint(self, ckpt_path: str):
@@ -251,6 +270,7 @@ class UnifiedModelTrainer:
                 loop.set_postfix(**postfix)
 
             metrics = self._run_validation(epoch)
+            self._save_samples(epoch)
             for k, v in metrics.items():
                 history[k].append(float(v))
 
@@ -298,16 +318,19 @@ class UnifiedModelTrainer:
                 pred_t    = self.model.forward_generate(
                     thermal, prev_thermal_f,
                     prev_pred_f.detach() if prev_pred_f is not None else None)
+                
+                pred_t_buffered = self.fake_buffer.push_and_pop(pred_t.detach())
+                
                 zeros_th  = torch.zeros_like(thermal)
                 zeros_vis = torch.zeros_like(visible)
                 if prev_thermal_f is None:
                     disc_fake = self.model.discriminator(
-                        thermal, pred_t.detach(), zeros_th, zeros_vis)
+                        thermal, pred_t_buffered, zeros_th, zeros_vis)
                     disc_real = self.model.discriminator(
                         thermal, visible, zeros_th, zeros_vis)
                 else:
                     disc_fake = self.model.discriminator(
-                        thermal, pred_t.detach(), prev_thermal_f, prev_pred_f.detach())
+                        thermal, pred_t_buffered, prev_thermal_f, prev_pred_f.detach())
                     disc_real = self.model.discriminator(
                         thermal, visible, prev_thermal_f, prev_target_f)
                 d_loss, _ = self.model.compute_discriminator_losses(disc_real, disc_fake)
@@ -366,25 +389,28 @@ class UnifiedModelTrainer:
         elif self.model_name == "DCNet":
             self.opts['main'].zero_grad()
             with autocast('cuda', enabled=self.use_amp):
-                pred, gen_patch_feats, _ = self.model(thermal, extract_features=True)
+                # Forward: thermal -> generated visible + encoder features
+                pred, src_feats, _ = self.model(thermal, extract_features=True)
                 l1_loss = self.base_criterion(pred, visible)
 
-                # PatchNCE: compare gen features vs visible-target features
-                # (was self-comparing thermal→thermal which produced zero loss)
-                with torch.no_grad():
-                    vis_gray = visible.mean(dim=1, keepdim=True)
-                    _, tgt_patch_feats, _ = self.model(vis_gray, extract_features=True)
-                patch_loss = sum(F.l1_loss(gf, tf.detach())
-                                 for gf, tf in zip(gen_patch_feats, tgt_patch_feats))
+                # PatchNCE: pass generated image BACK through encoder
+                # Convert 3ch pred to 1ch grayscale to match encoder input_nc=1
+                pred_gray = pred.mean(dim=1, keepdim=True)
+                _, gen_feats, _ = self.model(pred_gray, extract_features=True)
 
-                # Perceptual: pred needs gradient flow, target doesn't
+                # Compare source thermal features vs generated image features
+                # at same spatial positions — this is what PatchNCE does
+                patch_loss = sum(F.l1_loss(sf, gf.detach())
+                                 for sf, gf in zip(src_feats, gen_feats))
+
+                # Perceptual: generated vs real visible in VGG space
+                target_vgg = self.model.perceptual_guidance(visible)
                 pred_vgg = self.model.perceptual_guidance(pred)
-                with torch.no_grad():
-                    target_vgg = self.model.perceptual_guidance(visible)
                 perc_loss = sum(F.l1_loss(pv, tv.detach())
                                 for pv, tv in zip(pred_vgg, target_vgg))
 
-                loss = l1_loss + 1.0 * patch_loss + 1.0 * perc_loss
+                loss = l1_loss + patch_loss + 10.0 * perc_loss
+
             self.scalers['main'].scale(loss).backward()
             self.scalers['main'].unscale_(self.opts['main'])
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
@@ -427,10 +453,10 @@ class UnifiedModelTrainer:
 
             with autocast('cuda', enabled=self.use_amp):
                 if self.model_name == "Cond-DDPM":
-                    pred = self.model.sample(
+                    pred = self.model.sample_ddim(
                         thermal,
-                        shape=(thermal.shape[0], 3,
-                               thermal.shape[2], thermal.shape[3]))
+                        shape=(thermal.shape[0], 3, thermal.shape[2], thermal.shape[3]),
+                        ddim_steps=50)
 
                 elif self.model_name == "FWGAN":
                     B = thermal.shape[0]
@@ -488,6 +514,41 @@ class UnifiedModelTrainer:
         return {"psnr": final_psnr, "ssim": final_ssim,
                 "mae": final_mae,   "rmse": final_rmse, "fps": fps}
 
+    def _save_samples(self, epoch):
+        """Save visual samples: thermal | generated | ground truth for first 4 val images."""
+        self.model.eval()
+        save_dir = os.path.join("samples", self.model_name)
+        os.makedirs(save_dir, exist_ok=True)
+        images = []
+        count = 0
+        with torch.no_grad():
+            for batch in self.val_loader:
+                if count >= 4:
+                    break
+                thermal = batch['thermal'].to(self.device)
+                visible = batch['visible'].to(self.device)
+                with autocast('cuda', enabled=self.use_amp):
+                    if self.model_name == "Cond-DDPM":
+                        pred = self.model.sample_ddim(thermal, shape=(thermal.shape[0], 3, thermal.shape[2], thermal.shape[3]), ddim_steps=50)
+                    elif self.model_name == "FWGAN":
+                        pred = self.model.forward_generate(thermal)
+                    elif self.model_name == "VQ-InfraTrans":
+                        pred, _, _ = self.model(thermal)
+                    elif self.model_name == "DCNet":
+                        pred = self.model(thermal, extract_features=False)
+                    else:
+                        pred = self.model(thermal)
+                # Take first image from batch
+                t_img = (thermal[0].cpu() + 1) / 2  # (1, H, W) -> [0,1]
+                t_img = t_img.repeat(3, 1, 1)       # grayscale to 3ch
+                p_img = (pred[0].cpu().float() + 1) / 2
+                v_img = (visible[0].cpu() + 1) / 2
+                images.extend([t_img.clamp(0,1), p_img.clamp(0,1), v_img.clamp(0,1)])
+                count += 1
+        if images:
+            grid = make_grid(images, nrow=3, padding=2)
+            save_image(grid, os.path.join(save_dir, f"epoch_{epoch:02d}.png"))
+
 
 # --------------------------------------------------------------------------- #
 # Entry point
@@ -521,11 +582,11 @@ if __name__ == '__main__':
         "DCNet":         {"batch_size": 32, "epochs": 5},
         "FWGAN":         {"batch_size": 128, "epochs": 5},
         "VQ-InfraTrans": {"batch_size": 120, "epochs": 5},
-        "Inter-Mamba":   {"batch_size": 32, "epochs": 5},
-        "Cond-DDPM":     {"batch_size":  64, "epochs": 5},
-    }
-
-    for model_name, config in model_configs.items():
+        "Inter-Mamba":   {"batch_size": 32,  "epochs": 5},
+        "FWGAN":         {"batch_size": 128, "epochs": 5},
+        "VQ-InfraTrans": {"batch_size": 120, "epochs": 5},
+        "Inter-Mamba":   {"batch_size": 32,  "epochs": 5},
+        "Cond-DDPM":     {"batch_size": 64, items():
         ckpt_path = os.path.join(CKPT_DIR, f"{model_name}_final.pth")
 
         trainer = UnifiedModelTrainer(
@@ -566,3 +627,55 @@ if __name__ == '__main__':
 
     print("\nAll architecture benchmark loops complete.")
     print(f"Final metrics in '{RESULTS_PATH}'.")
+
+    # Generate final comparison grid
+    print("Generating final comparison grid...")
+    os.makedirs("samples", exist_ok=True)
+    comparison_images = []
+    # Get 6 test images
+    test_loader = create_dataloader(THERMAL_DIR, VISIBLE_DIR, mode="paired", is_train=False, batch_size=1)
+    test_samples = []
+    for i, batch in enumerate(test_loader):
+        if i >= 6:
+            break
+        test_samples.append(batch)
+
+    model_names_ordered = ["DCNet", "FWGAN", "VQ-InfraTrans", "Inter-Mamba", "Cond-DDPM"]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    for sample in test_samples:
+        thermal = sample['thermal'].to(device)
+        visible = sample['visible'].to(device)
+        row = [(thermal[0].cpu() + 1) / 2]
+        row[0] = row[0].repeat(3, 1, 1) if row[0].shape[0] == 1 else row[0]
+
+        for mn in model_names_ordered:
+            ckpt = os.path.join(CKPT_DIR, f"{mn}_final.pth")
+            if not os.path.exists(ckpt):
+                row.append(torch.zeros(3, 256, 256))
+                continue
+            # Create a temporary trainer just to load the model
+            tmp = UnifiedModelTrainer(mn, THERMAL_DIR, VISIBLE_DIR, batch_size=1, epochs=1, device="cuda")
+            tmp.load_checkpoint(ckpt)
+            tmp.model.eval()
+            with torch.no_grad(), autocast('cuda', enabled=True):
+                if mn == "Cond-DDPM":
+                    p = tmp.model.sample_ddim(thermal, shape=(1,3,256,256), ddim_steps=50)
+                elif mn == "FWGAN":
+                    p = tmp.model.forward_generate(thermal)
+                elif mn == "VQ-InfraTrans":
+                    p, _, _ = tmp.model(thermal)
+                elif mn == "DCNet":
+                    p = tmp.model(thermal, extract_features=False)
+                else:
+                    p = tmp.model(thermal)
+            row.append((p[0].cpu().float() + 1) / 2)
+            del tmp
+
+        row.append((visible[0].cpu() + 1) / 2)
+        comparison_images.extend([img.clamp(0, 1) for img in row])
+
+    if comparison_images:
+        grid = make_grid(comparison_images, nrow=7, padding=4)
+        save_image(grid, "samples/final_comparison.png")
+        print("Saved samples/final_comparison.png")

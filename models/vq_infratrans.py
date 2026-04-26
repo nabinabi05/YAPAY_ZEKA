@@ -39,7 +39,7 @@ class VectorQuantizer(nn.Module):
     """
 
     def __init__(self, num_embeddings: int, embedding_dim: int,
-                 commitment_cost: float = 0.25,
+                 commitment_cost: float = 0.5,
                  ema_decay: float = 0.99,
                  dead_threshold: int = 100):
         super().__init__()
@@ -117,7 +117,7 @@ class VectorQuantizer(nn.Module):
                 if num_dead > 0:
                     # Reinitialise dead codes to random encoder outputs
                     rand_idx   = torch.randperm(flat.size(0), device=flat.device)[:num_dead]
-                    flat_f32   = flat[rand_idx].detach().float()   # fp16 -> fp32
+                    flat_f32   = flat[rand_idx].detach().float()
                     self.embedding.weight.data[dead_mask] = flat_f32
                     self.ema_weight_sum[dead_mask]        = flat_f32
                     self.ema_cluster_size[dead_mask]      = 1.0

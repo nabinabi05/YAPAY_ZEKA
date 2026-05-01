@@ -1,9 +1,7 @@
-*.pth
 data/LLVIP/
 __pycache__/
 *.png
 results.json
-checkpoints/
 .DS_Store
 .venv/
 env/

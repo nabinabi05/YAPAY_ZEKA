@@ -1,21 +1,17 @@
 """
 FWGAN 100-Epoch Training Script for Google Colab
 =================================================
-Run this file as a single cell (or multiple cells separated by the comments)
-in Google Colab with a GPU runtime.
+Run via the COLAB_NOTEBOOK_CELLS.md setup cell which handles:
+  - Drive mount, GitHub clone, dataset extraction
+  - All outputs saved to MyDrive/FWGAN_100ep/
 
 What it does:
-  1. Installs dependencies & clones the repo
-  2. Downloads + extracts the LLVIP dataset
-  3. Trains FWGAN for 100 epochs
-  4. Saves sample images every 10 epochs (thermal | generated | ground truth)
-  5. Logs PSNR, SSIM, MAE, RMSE every epoch
-  6. Plots metric curves at the end
-  7. Saves final checkpoint
-
-Usage:
-  - Open Google Colab, set runtime to GPU (T4 or better)
-  - Copy-paste this entire file into a cell and run
+  1. Finds LLVIP dataset (auto-detects from Drive zip)
+  2. Trains FWGAN for 100 epochs
+  3. Saves sample images every 5 epochs (train | val comparison)
+  4. Logs PSNR, SSIM, MAE, RMSE every epoch
+  5. Plots metric curves at the end
+  6. Saves checkpoints every 25 epochs + final
 """
 
 # ============================================================================ #
@@ -26,20 +22,11 @@ import subprocess, sys, os
 def install(pkg):
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
 
-# Install what Colab doesn't have by default
 install("scikit-image")
 
-# Clone the repo if not already present
-REPO_DIR = "/content/YAPAY_ZEKA-master"
-if not os.path.exists(REPO_DIR):
-    print("Cloning repository...")
-    subprocess.run(["git", "clone", "https://github.com/nabinabi05/YAPAY_ZEKA.git", REPO_DIR], check=True)
-    print("Repository cloned.")
-else:
-    print(f"Repository already exists at {REPO_DIR}")
-
-os.chdir(REPO_DIR)
-sys.path.insert(0, REPO_DIR)
+# REPO_DIR is wherever this script lives — set by the notebook cell via os.chdir()
+REPO_DIR = os.getcwd()
+print(f"Working directory: {REPO_DIR}")
 
 # ============================================================================ #
 # CELL 2 — Dataset Setup (Drive → /content SSD)
@@ -56,14 +43,22 @@ DRIVE_MYDIR   = "/content/drive/MyDrive"
 DRIVE_DATASET = os.path.join(DRIVE_MYDIR, "LLVIP")  # pre-extracted in Drive (optional)
 
 def find_llvip_dirs(search_root):
-    """Recursively find infrared/ and visible/ dirs with images."""
+    """
+    Recursively find infrared/ and visible/ dirs.
+    Accepts the dir even if images live in subdirs (e.g. infrared/train/).
+    """
+    def has_images_recursive(path):
+        for r, _, fs in os.walk(path):
+            if any(f.lower().endswith(('.jpg', '.png', '.jpeg')) for f in fs):
+                return True
+        return False
+
     thermal_dir = visible_dir = None
     for root, dirs, files in os.walk(search_root):
         basename = os.path.basename(root)
-        has_images = any(f.lower().endswith(('.jpg', '.png', '.jpeg')) for f in files)
-        if basename == "infrared" and has_images:
+        if basename == "infrared" and has_images_recursive(root):
             thermal_dir = root
-        elif basename == "visible" and has_images:
+        elif basename == "visible" and has_images_recursive(root):
             visible_dir = root
         if thermal_dir and visible_dir:
             break
@@ -103,20 +98,24 @@ if not THERMAL_DIR and os.path.isdir(DRIVE_MYDIR):
         print("Extracting to /content/LLVIP (this takes ~2 min, only once per session)...")
         os.makedirs(DATASET_LOCAL, exist_ok=True)
         ret = subprocess.run(
-            ["unzip", "-q", zip_path, "-d", DATASET_LOCAL],
-            capture_output=True)
+            ["unzip", "-q", zip_path, "-d", DATASET_LOCAL])
         if ret.returncode == 0:
+            # Search broadly after extraction — zip may create nested dirs
             THERMAL_DIR, VISIBLE_DIR = find_llvip_dirs(DATASET_LOCAL)
+            if not THERMAL_DIR:
+                THERMAL_DIR, VISIBLE_DIR = find_llvip_dirs("/content")
             if THERMAL_DIR:
-                print("✅ Extracted successfully to /content/LLVIP")
-                # Also save extracted copy back to Drive for faster future sessions
-                # (skip if Drive copy already exists to save Drive space)
+                print(f"✅ Extracted successfully. Found at: {THERMAL_DIR}")
                 if not os.path.isdir(DRIVE_DATASET):
                     print("💾 Saving extracted dataset to Drive for future sessions...")
                     shutil.copytree(DATASET_LOCAL, DRIVE_DATASET, dirs_exist_ok=True)
                     print(f"   Saved → {DRIVE_DATASET}")
+            else:
+                # Show what was actually extracted to help debug
+                print("⚠️  Unzip done but infrared/visible dirs not found. Extracted contents:")
+                subprocess.run(["find", DATASET_LOCAL, "-type", "d", "-maxdepth", "4"])
         else:
-            print(f"unzip error: {ret.stderr.decode()}")
+            print(f"❌ unzip failed with code {ret.returncode}")
     else:
         print("No LLVIP zip found in Drive.")
 

@@ -95,10 +95,15 @@ if not THERMAL_DIR and os.path.isdir(DRIVE_MYDIR):
     zip_path = find_zip_in_drive(DRIVE_MYDIR)
     if zip_path:
         print(f"Found zip: {zip_path}")
-        print("Extracting to /content/LLVIP (this takes ~2 min, only once per session)...")
+        # Remove previous partial extraction (causes "overwrite?" prompts in unzip)
+        import shutil as _shutil
+        if os.path.exists(DATASET_LOCAL):
+            print("Removing previous partial extraction...")
+            _shutil.rmtree(DATASET_LOCAL)
         os.makedirs(DATASET_LOCAL, exist_ok=True)
+        print("Extracting to /content/LLVIP (this takes ~2 min, only once per session)...")
         ret = subprocess.run(
-            ["unzip", "-q", zip_path, "-d", DATASET_LOCAL])
+            ["unzip", "-o", "-q", zip_path, "-d", DATASET_LOCAL])  # -o = overwrite without asking
         if ret.returncode == 0:
             # Search broadly after extraction — zip may create nested dirs
             THERMAL_DIR, VISIBLE_DIR = find_llvip_dirs(DATASET_LOCAL)
@@ -113,7 +118,7 @@ if not THERMAL_DIR and os.path.isdir(DRIVE_MYDIR):
             else:
                 # Show what was actually extracted to help debug
                 print("⚠️  Unzip done but infrared/visible dirs not found. Extracted contents:")
-                subprocess.run(["find", DATASET_LOCAL, "-type", "d", "-maxdepth", "4"])
+                subprocess.run(["find", DATASET_LOCAL, "-type", "d", "-maxdepth", "5"])
         else:
             print(f"❌ unzip failed with code {ret.returncode}")
     else:

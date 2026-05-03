@@ -42,113 +42,109 @@ os.chdir(REPO_DIR)
 sys.path.insert(0, REPO_DIR)
 
 # ============================================================================ #
-# CELL 2 — Find or Download LLVIP Dataset
+# CELL 2 — Dataset Setup (Drive → /content SSD)
+# ============================================================================ #
+# Strategy:
+#   1. Dataset zip lives in Google Drive (slow network storage)
+#   2. Unzip once to /content (fast local SSD) each session
+#   3. Train from /content — much faster I/O than Drive directly
+#   4. Outputs (checkpoints, samples) go back to Drive permanently
 # ============================================================================ #
 
-def find_llvip_dirs(search_root="/content"):
-    """Auto-detect infrared/visible dirs anywhere under search_root."""
+DATASET_LOCAL = "/content/LLVIP"          # fast SSD target
+DRIVE_MYDIR   = "/content/drive/MyDrive"
+DRIVE_DATASET = os.path.join(DRIVE_MYDIR, "LLVIP")  # pre-extracted in Drive (optional)
+
+def find_llvip_dirs(search_root):
+    """Recursively find infrared/ and visible/ dirs with images."""
     thermal_dir = visible_dir = None
     for root, dirs, files in os.walk(search_root):
         basename = os.path.basename(root)
-        if basename == "infrared" and any(
-            f.lower().endswith(('.jpg','.png','.jpeg'))
-            for f in (files or [])
-        ):
+        has_images = any(f.lower().endswith(('.jpg', '.png', '.jpeg')) for f in files)
+        if basename == "infrared" and has_images:
             thermal_dir = root
-        elif basename == "visible" and any(
-            f.lower().endswith(('.jpg','.png','.jpeg'))
-            for f in (files or [])
-        ):
+        elif basename == "visible" and has_images:
             visible_dir = root
-        # Also check train/ subdirectories
-        if basename in ("infrared", "visible"):
-            train_sub = os.path.join(root, "train")
-            if os.path.isdir(train_sub):
-                if basename == "infrared":
-                    thermal_dir = root
-                else:
-                    visible_dir = root
         if thermal_dir and visible_dir:
             break
     return thermal_dir, visible_dir
 
-# Step 1: Try known paths
-KNOWN_PATHS = [
-    (os.path.join(REPO_DIR, "data", "LLVIP", "LLVIP", "infrared"),
-     os.path.join(REPO_DIR, "data", "LLVIP", "LLVIP", "visible")),
-    (os.path.join(REPO_DIR, "data", "LLVIP", "infrared"),
-     os.path.join(REPO_DIR, "data", "LLVIP", "visible")),
-    ("/content/LLVIP/infrared", "/content/LLVIP/visible"),
-    ("/content/LLVIP/LLVIP/infrared", "/content/LLVIP/LLVIP/visible"),
-]
+def find_zip_in_drive(drive_root):
+    """Find LLVIP zip anywhere in Drive."""
+    for root, dirs, files in os.walk(drive_root):
+        for f in files:
+            if "llvip" in f.lower() and f.lower().endswith(".zip"):
+                return os.path.join(root, f)
+    return None
 
 THERMAL_DIR = VISIBLE_DIR = None
-for t_path, v_path in KNOWN_PATHS:
-    if os.path.exists(t_path) and os.path.exists(v_path):
-        THERMAL_DIR, VISIBLE_DIR = t_path, v_path
-        print(f"Found dataset at known path:\n  Thermal: {THERMAL_DIR}\n  Visible: {VISIBLE_DIR}")
-        break
 
-# Step 2: Auto-search /content
+# ── Step 1: Check if already unzipped to /content this session ───────────────
+print("Looking for LLVIP dataset...")
+THERMAL_DIR, VISIBLE_DIR = find_llvip_dirs(DATASET_LOCAL)
+if THERMAL_DIR and VISIBLE_DIR:
+    print(f"✅ Dataset already in /content (fast SSD)")
+
+# ── Step 2: Try pre-extracted copy in Drive ───────────────────────────────────
+if not THERMAL_DIR and os.path.isdir(DRIVE_DATASET):
+    print("Found extracted LLVIP in Drive — copying to /content SSD...")
+    import shutil
+    shutil.copytree(DRIVE_DATASET, DATASET_LOCAL, dirs_exist_ok=True)
+    THERMAL_DIR, VISIBLE_DIR = find_llvip_dirs(DATASET_LOCAL)
+    if THERMAL_DIR:
+        print("✅ Copied from Drive to /content")
+
+# ── Step 3: Find zip in Drive and extract ─────────────────────────────────────
+if not THERMAL_DIR and os.path.isdir(DRIVE_MYDIR):
+    print("Searching Drive for LLVIP zip...")
+    zip_path = find_zip_in_drive(DRIVE_MYDIR)
+    if zip_path:
+        print(f"Found zip: {zip_path}")
+        print("Extracting to /content/LLVIP (this takes ~2 min, only once per session)...")
+        os.makedirs(DATASET_LOCAL, exist_ok=True)
+        ret = subprocess.run(
+            ["unzip", "-q", zip_path, "-d", DATASET_LOCAL],
+            capture_output=True)
+        if ret.returncode == 0:
+            THERMAL_DIR, VISIBLE_DIR = find_llvip_dirs(DATASET_LOCAL)
+            if THERMAL_DIR:
+                print("✅ Extracted successfully to /content/LLVIP")
+                # Also save extracted copy back to Drive for faster future sessions
+                # (skip if Drive copy already exists to save Drive space)
+                if not os.path.isdir(DRIVE_DATASET):
+                    print("💾 Saving extracted dataset to Drive for future sessions...")
+                    shutil.copytree(DATASET_LOCAL, DRIVE_DATASET, dirs_exist_ok=True)
+                    print(f"   Saved → {DRIVE_DATASET}")
+        else:
+            print(f"unzip error: {ret.stderr.decode()}")
+    else:
+        print("No LLVIP zip found in Drive.")
+
+# ── Step 4: Search all of /content as fallback ────────────────────────────────
 if not THERMAL_DIR:
-    print("Searching /content for LLVIP dataset...")
+    print("Scanning /content for any existing dataset...")
     THERMAL_DIR, VISIBLE_DIR = find_llvip_dirs("/content")
-    if THERMAL_DIR and VISIBLE_DIR:
-        print(f"Auto-detected dataset:\n  Thermal: {THERMAL_DIR}\n  Visible: {VISIBLE_DIR}")
 
-# Step 3: Download if not found
+# ── Final check ───────────────────────────────────────────────────────────────
 if not THERMAL_DIR or not VISIBLE_DIR:
-    print("Dataset not found. Attempting download via Kaggle...")
-    DATA_DIR = os.path.join(REPO_DIR, "data")
-    os.makedirs(DATA_DIR, exist_ok=True)
-
-    downloaded = False
-
-    # Method 1: Try opendatalab (direct HTTP, no auth needed)
-    try:
-        install("gdown")
-        import gdown
-        LLVIP_URL = "https://drive.google.com/uc?id=1VWmKEjPAHj3FGSQPK_AWzery7bC6GXG0"
-        ZIP_PATH  = os.path.join(DATA_DIR, "LLVIP.zip")
-        gdown.download(LLVIP_URL, ZIP_PATH, quiet=False, fuzzy=True)
-        subprocess.run(["unzip", "-q", ZIP_PATH, "-d", os.path.join(DATA_DIR, "LLVIP")], check=True)
-        os.remove(ZIP_PATH)
-        downloaded = True
-    except Exception as e:
-        print(f"  gdown failed: {e}")
-
-    if not downloaded:
-        print("\n" + "="*60)
-        print("  AUTOMATIC DOWNLOAD FAILED")
-        print("="*60)
-        print("\nPlease download LLVIP manually using ONE of these methods:\n")
-        print("METHOD 1 — Upload a zip to Colab:")
-        print("  1. Download from: https://bupt-ai-cz.github.io/LLVIP/")
-        print("  2. In Colab, use the file browser (left panel) to upload")
-        print("  3. Then run in a new cell:")
-        print("     !unzip /content/LLVIP.zip -d /content/LLVIP\n")
-        print("METHOD 2 — Kaggle:")
-        print("  1. pip install kaggle")
-        print("  2. Upload your kaggle.json API key")
-        print("  3. !kaggle datasets download -d ... -p /content/LLVIP\n")
-        print("After downloading, re-run this cell.")
-        print("="*60)
-
-    # Re-search after download
-    THERMAL_DIR, VISIBLE_DIR = find_llvip_dirs("/content")
-
-# Final verification
-assert THERMAL_DIR and os.path.exists(THERMAL_DIR), \
-    f"Thermal dir not found! Searched /content recursively. Please download LLVIP dataset."
-assert VISIBLE_DIR and os.path.exists(VISIBLE_DIR), \
-    f"Visible dir not found! Searched /content recursively. Please download LLVIP dataset."
+    print("\n" + "="*60)
+    print("  DATASET NOT FOUND")
+    print("="*60)
+    print("\nUpload LLVIP zip to Google Drive, then re-run.")
+    print("Expected location in Drive:  MyDrive/LLVIP.zip  (any subfolder works)")
+    print("\nOR run this in a new cell to manually specify:")
+    print("  ZIP_PATH = '/content/drive/MyDrive/your/path/LLVIP.zip'")
+    print("  !unzip -q {ZIP_PATH} -d /content/LLVIP")
+    print("="*60)
+    raise FileNotFoundError("LLVIP dataset not found. Upload zip to Drive.")
 
 from data.dataset import get_image_paths
 n_thermal = len(get_image_paths(THERMAL_DIR))
 n_visible = len(get_image_paths(VISIBLE_DIR))
-print(f"Dataset: {n_thermal} thermal, {n_visible} visible images")
+print(f"\nDataset ready: {n_thermal} thermal, {n_visible} visible images")
 print(f"  Thermal: {THERMAL_DIR}")
 print(f"  Visible: {VISIBLE_DIR}")
+
 
 # ============================================================================ #
 # CELL 3 — Imports & Config

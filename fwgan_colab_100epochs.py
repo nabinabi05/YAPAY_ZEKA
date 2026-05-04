@@ -308,23 +308,38 @@ def run_validation(model, val_loader, epoch, device, use_amp):
     """Full validation pass computing PSNR, SSIM, MAE, RMSE, FPS."""
     model.eval()
     psnr_list, ssim_list, mae_list, mse_list, times = [], [], [], [], []
+    prev_pred_val    = None
+    prev_thermal_val = None
 
     for batch in val_loader:
         thermal = batch['thermal'].to(device)
         visible = batch['visible'].to(device)
         B = thermal.shape[0]
 
+        # Handle batch-size shrinkage on last batch
+        if prev_thermal_val is not None and prev_thermal_val.shape[0] != B:
+            prev_thermal_val = prev_thermal_val[:B]
+        if prev_pred_val is not None and prev_pred_val.shape[0] != B:
+            prev_pred_val = prev_pred_val[:B]
+
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         t0 = time.time()
 
         with autocast('cuda', enabled=use_amp):
-            # Pass None for temporal context since dataset is static images
-            pred = model.forward_generate(thermal, None, None)
+            pred = model.forward_generate(
+                thermal,
+                prev_thermal_val if prev_thermal_val is not None
+                                 else torch.zeros_like(thermal),
+                prev_pred_val    if prev_pred_val    is not None
+                                 else torch.zeros_like(visible))
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         times.append((time.time() - t0) / B)
+
+        prev_pred_val    = pred.detach()
+        prev_thermal_val = thermal.detach()
 
         b_psnr, b_ssim, b_mae, b_mse = evaluate_batch_metrics(pred, visible)
         psnr_list.append(b_psnr)
@@ -366,15 +381,20 @@ def save_samples(model, val_loader, epoch, device, use_amp, save_dir,
     """
     model.eval()
 
-    def make_triplets(thermal_b, visible_b):
+    def make_triplets(thermal_b, visible_b, prev_th=None, prev_pr=None):
         """Generate (thermal, pred, visible) triplet images for one batch."""
+        B = thermal_b.shape[0]
+        if prev_th is None:
+            prev_th = torch.zeros_like(thermal_b)
+        if prev_pr is None:
+            prev_pr = torch.zeros_like(visible_b)
         with autocast('cuda', enabled=use_amp):
-            pred = model.forward_generate(thermal_b, None, None)
+            pred = model.forward_generate(thermal_b, prev_th, prev_pr)
         t_img = (thermal_b[0].cpu() + 1) / 2
         t_img = t_img.repeat(3, 1, 1)
         p_img = (pred[0].cpu().float() + 1) / 2
         v_img = (visible_b[0].cpu() + 1) / 2
-        return [t_img.clamp(0,1), p_img.clamp(0,1), v_img.clamp(0,1)]
+        return [t_img.clamp(0,1), p_img.clamp(0,1), v_img.clamp(0,1)], pred.detach(), thermal_b.detach()
 
     all_images = []
 
@@ -382,7 +402,7 @@ def save_samples(model, val_loader, epoch, device, use_amp, save_dir,
     if train_batch is not None:
         thermal_tr = train_batch['thermal'].to(device)[:n_samples]
         visible_tr = train_batch['visible'].to(device)[:n_samples]
-        triplets = make_triplets(thermal_tr, visible_tr)
+        triplets, _, _ = make_triplets(thermal_tr, visible_tr)
         all_images.extend(triplets)
         # Add a blank separator row (all white) to visually divide train/val
         blank = torch.ones(3, thermal_tr.shape[2], thermal_tr.shape[3])
@@ -390,14 +410,23 @@ def save_samples(model, val_loader, epoch, device, use_amp, save_dir,
 
     # ── Validation samples ────────────────────────────────────────────────
     count          = 0
+    prev_pred_s    = None
+    prev_thermal_s = None
 
     for batch in val_loader:
         if count >= n_samples:
             break
         thermal = batch['thermal'].to(device)
         visible = batch['visible'].to(device)
-        
-        triplets = make_triplets(thermal, visible)
+        B = thermal.shape[0]
+
+        if prev_thermal_s is not None and prev_thermal_s.shape[0] != B:
+            prev_thermal_s = prev_thermal_s[:B]
+        if prev_pred_s is not None and prev_pred_s.shape[0] != B:
+            prev_pred_s = prev_pred_s[:B]
+
+        triplets, prev_pred_s, prev_thermal_s = make_triplets(
+            thermal, visible, prev_thermal_s, prev_pred_s)
         all_images.extend(triplets)
         count += 1
 
@@ -425,28 +454,37 @@ for epoch in range(1, EPOCHS + 1):
     loop = tqdm(train_loader, desc=f"Epoch [{epoch:3d}/{EPOCHS}]",
                 leave=True, ncols=100)
 
+    prev_pred_f    = None
+    prev_target_f  = None
+    prev_thermal_f = None
     epoch_g_losses = []
     epoch_d_losses = []
 
     for batch in loop:
         thermal = batch['thermal'].to(DEVICE)
         visible = batch['visible'].to(DEVICE)
-        
-        # Prepare zeros for missing temporal context
-        zeros_th  = torch.zeros_like(thermal)
-        zeros_vis = torch.zeros_like(visible)
 
         # ── Step 1: Discriminator ─────────────────────────────────────────
         opt_disc.zero_grad()
         with autocast('cuda', enabled=USE_AMP):
-            # Generate fake with no temporal context
-            pred_t = model.forward_generate(thermal, None, None)
+            pred_t = model.forward_generate(
+                thermal, prev_thermal_f,
+                prev_pred_f.detach() if prev_pred_f is not None else None)
 
-            # Replay buffer for stability
             pred_t_buffered = fake_buffer.push_and_pop(pred_t.detach())
 
-            disc_fake = model.discriminator(thermal, pred_t_buffered, zeros_th, zeros_vis)
-            disc_real = model.discriminator(thermal, visible, zeros_th, zeros_vis)
+            zeros_th  = torch.zeros_like(thermal)
+            zeros_vis = torch.zeros_like(visible)
+            if prev_thermal_f is None:
+                disc_fake = model.discriminator(
+                    thermal, pred_t_buffered, zeros_th, zeros_vis)
+                disc_real = model.discriminator(
+                    thermal, visible, zeros_th, zeros_vis)
+            else:
+                disc_fake = model.discriminator(
+                    thermal, pred_t_buffered, prev_thermal_f, prev_pred_f.detach())
+                disc_real = model.discriminator(
+                    thermal, visible, prev_thermal_f, prev_target_f)
 
             d_loss, _ = model.compute_discriminator_losses(disc_real, disc_fake)
 
@@ -459,16 +497,30 @@ for epoch in range(1, EPOCHS + 1):
         # ── Step 2: Generator ─────────────────────────────────────────────
         opt_gen.zero_grad()
         with autocast('cuda', enabled=USE_AMP):
-            disc_for_gen = model.discriminator(thermal, pred_t, zeros_th, zeros_vis)
+            if prev_thermal_f is None:
+                disc_for_gen = model.discriminator(
+                    thermal, pred_t, zeros_th, zeros_vis)
+            else:
+                disc_for_gen = model.discriminator(
+                    thermal, pred_t, prev_thermal_f, prev_pred_f.detach())
 
             g_loss, g_log = model.compute_generator_losses(
-                pred_t, visible, None, None, disc_for_gen)
+                pred_t, visible, prev_pred_f, prev_target_f, disc_for_gen)
 
         scaler_gen.scale(g_loss).backward()
         scaler_gen.unscale_(opt_gen)
         torch.nn.utils.clip_grad_norm_(model.generator.parameters(), GRAD_CLIP)
         scaler_gen.step(opt_gen)
         scaler_gen.update()
+
+        # ── Update previous-frame state ───────────────────────────────────
+        with torch.no_grad():
+            prev_pred_f = model.forward_generate(
+                thermal, prev_thermal_f,
+                prev_pred_f.detach() if prev_pred_f is not None else None
+            ).detach()
+        prev_target_f  = visible.detach()
+        prev_thermal_f = thermal.detach()
 
         epoch_g_losses.append(g_loss.item())
         epoch_d_losses.append(d_loss.item())

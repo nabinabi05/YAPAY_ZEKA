@@ -111,10 +111,6 @@ if not THERMAL_DIR and os.path.isdir(DRIVE_MYDIR):
                 THERMAL_DIR, VISIBLE_DIR = find_llvip_dirs("/content")
             if THERMAL_DIR:
                 print(f"✅ Extracted successfully. Found at: {THERMAL_DIR}")
-                if not os.path.isdir(DRIVE_DATASET):
-                    print("💾 Saving extracted dataset to Drive for future sessions...")
-                    shutil.copytree(DATASET_LOCAL, DRIVE_DATASET, dirs_exist_ok=True)
-                    print(f"   Saved → {DRIVE_DATASET}")
             else:
                 # Show what was actually extracted to help debug
                 print("⚠️  Unzip done but infrared/visible dirs not found. Extracted contents:")

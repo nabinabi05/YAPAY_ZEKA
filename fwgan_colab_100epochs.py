@@ -381,20 +381,15 @@ def save_samples(model, val_loader, epoch, device, use_amp, save_dir,
     """
     model.eval()
 
-    def make_triplets(thermal_b, visible_b, prev_th=None, prev_pr=None):
+    def make_triplets(thermal_b, visible_b):
         """Generate (thermal, pred, visible) triplet images for one batch."""
-        B = thermal_b.shape[0]
-        if prev_th is None:
-            prev_th = torch.zeros_like(thermal_b)
-        if prev_pr is None:
-            prev_pr = torch.zeros_like(visible_b)
         with autocast('cuda', enabled=use_amp):
-            pred = model.forward_generate(thermal_b, prev_th, prev_pr)
+            pred = model.forward_generate(thermal_b, None, None)
         t_img = (thermal_b[0].cpu() + 1) / 2
         t_img = t_img.repeat(3, 1, 1)
         p_img = (pred[0].cpu().float() + 1) / 2
         v_img = (visible_b[0].cpu() + 1) / 2
-        return [t_img.clamp(0,1), p_img.clamp(0,1), v_img.clamp(0,1)], pred.detach(), thermal_b.detach()
+        return [t_img.clamp(0,1), p_img.clamp(0,1), v_img.clamp(0,1)]
 
     all_images = []
 
@@ -402,7 +397,7 @@ def save_samples(model, val_loader, epoch, device, use_amp, save_dir,
     if train_batch is not None:
         thermal_tr = train_batch['thermal'].to(device)[:n_samples]
         visible_tr = train_batch['visible'].to(device)[:n_samples]
-        triplets, _, _ = make_triplets(thermal_tr, visible_tr)
+        triplets = make_triplets(thermal_tr, visible_tr)
         all_images.extend(triplets)
         # Add a blank separator row (all white) to visually divide train/val
         blank = torch.ones(3, thermal_tr.shape[2], thermal_tr.shape[3])
@@ -410,23 +405,14 @@ def save_samples(model, val_loader, epoch, device, use_amp, save_dir,
 
     # ── Validation samples ────────────────────────────────────────────────
     count          = 0
-    prev_pred_s    = None
-    prev_thermal_s = None
 
     for batch in val_loader:
         if count >= n_samples:
             break
         thermal = batch['thermal'].to(device)
         visible = batch['visible'].to(device)
-        B = thermal.shape[0]
 
-        if prev_thermal_s is not None and prev_thermal_s.shape[0] != B:
-            prev_thermal_s = prev_thermal_s[:B]
-        if prev_pred_s is not None and prev_pred_s.shape[0] != B:
-            prev_pred_s = prev_pred_s[:B]
-
-        triplets, prev_pred_s, prev_thermal_s = make_triplets(
-            thermal, visible, prev_thermal_s, prev_pred_s)
+        triplets = make_triplets(thermal, visible)
         all_images.extend(triplets)
         count += 1
 

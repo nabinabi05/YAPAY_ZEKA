@@ -134,11 +134,14 @@ class UnifiedModelTrainer:
     """
 
     def __init__(self, model_name: str, thermal_dir: str, visible_dir: str,
-                 batch_size: int = 4, epochs: int = 5, device: str = "cuda"):
+                 batch_size: int = 4, epochs: int = 5, device: str = "cuda",
+                 ckpt_dir: str = "checkpoints"):
         self.device     = torch.device(device if torch.cuda.is_available() else "cpu")
         self.model_name = model_name
         self.epochs     = epochs
         self.use_amp    = self.device.type == "cuda"
+        self.ckpt_dir   = ckpt_dir
+        os.makedirs(ckpt_dir, exist_ok=True)
 
         print(f"Initializing DataLoader hooks for benchmark task: {model_name}...")
 
@@ -219,8 +222,10 @@ class UnifiedModelTrainer:
 
     def load_checkpoint(self, ckpt_path: str):
         """Loads saved weights into the model (used for validation-only recovery)."""
-        self.model.load_state_dict(
-            torch.load(ckpt_path, map_location=self.device))
+        data = torch.load(ckpt_path, map_location=self.device)
+        # Accept both bare state_dict and wrapped checkpoint dicts
+        state = data.get("model_state", data)
+        self.model.load_state_dict(state)
         print(f"[LOADED] Weights restored from '{ckpt_path}'")
 
     # ---------------------------------------------------------------------- #
@@ -230,17 +235,39 @@ class UnifiedModelTrainer:
     def run_training_loop(self) -> dict:
         history = {"psnr": [], "ssim": [], "mae": [], "rmse": [], "fps": [],
                    "evaluated_epochs": []}
+        start_epoch = 1
 
         total_params = sum(p.numel() for p in self.model.parameters()
                            if p.requires_grad)
         print(f"[{self.model_name}] Total Trainable Parameters: {total_params:,}")
 
+        # ── Resume from partial checkpoint if one exists ──────────────────── #
+        partial_path = os.path.join(self.ckpt_dir, f"{self.model_name}_partial.pth")
+        if os.path.exists(partial_path):
+            print(f"[RESUME] Found partial checkpoint — continuing from saved epoch.")
+            ckpt = torch.load(partial_path, map_location=self.device)
+            self.model.load_state_dict(ckpt["model_state"])
+            for k, opt in self.opts.items():
+                if k in ckpt["opts_state"]:
+                    opt.load_state_dict(ckpt["opts_state"][k])
+            for k, sched in self.schedulers.items():
+                if k in ckpt["schedulers_state"]:
+                    sched.load_state_dict(ckpt["schedulers_state"][k])
+            for k, scaler in self.scalers.items():
+                if k in ckpt["scalers_state"]:
+                    scaler.load_state_dict(ckpt["scalers_state"][k])
+            history          = ckpt["history"]
+            self._step_count = ckpt["step_count"]
+            start_epoch      = ckpt["epoch"] + 1
+            print(f"[RESUME] Resuming from epoch {start_epoch}/{self.epochs}")
+
         # Cond-DDPM evaluation requires running 50-step DDIM sampling over the
         # entire val set, which dwarfs training time per epoch. Throttle it to
         # every 5 epochs + the final epoch.
-        eval_every = 5 if self.model_name == "Cond-DDPM" else 1
+        eval_every      = 5 if self.model_name == "Cond-DDPM" else 1
+        checkpoint_every = 5   # save partial checkpoint every N epochs
 
-        for epoch in range(1, self.epochs + 1):
+        for epoch in range(start_epoch, self.epochs + 1):
             self.model.train()
             loop = tqdm(self.train_loader, desc=f"Epoch [{epoch}/{self.epochs}]")
 
@@ -291,11 +318,31 @@ class UnifiedModelTrainer:
                       f"{((epoch // eval_every) + 1) * eval_every}); "
                       f"avg loss: {np.mean(epoch_losses):.4f}")
 
+            # ── Partial checkpoint every N epochs (enables crash recovery) ── #
+            if epoch % checkpoint_every == 0 and epoch < self.epochs:
+                partial_path = os.path.join(self.ckpt_dir,
+                                            f"{self.model_name}_partial.pth")
+                torch.save({
+                    "epoch":            epoch,
+                    "model_state":      self.model.state_dict(),
+                    "opts_state":       {k: o.state_dict() for k, o in self.opts.items()},
+                    "schedulers_state": {k: s.state_dict() for k, s in self.schedulers.items()},
+                    "scalers_state":    {k: s.state_dict() for k, s in self.scalers.items()},
+                    "history":          history,
+                    "step_count":       self._step_count,
+                }, partial_path)
+                print(f"[CKPT] Partial checkpoint saved at epoch {epoch} → {partial_path}")
+
         history["total_parameters"] = total_params
-        os.makedirs("checkpoints", exist_ok=True)
-        ckpt_path = os.path.join("checkpoints", f"{self.model_name}_final.pth")
+        ckpt_path = os.path.join(self.ckpt_dir, f"{self.model_name}_final.pth")
         torch.save(self.model.state_dict(), ckpt_path)
         print(f"Saved weights -> {ckpt_path}")
+
+        # Clean up partial checkpoint now that training is complete
+        partial_path = os.path.join(self.ckpt_dir, f"{self.model_name}_partial.pth")
+        if os.path.exists(partial_path):
+            os.remove(partial_path)
+            print(f"[CKPT] Partial checkpoint removed (training complete).")
 
         return history
 
@@ -411,14 +458,16 @@ class UnifiedModelTrainer:
                 pred, src_feats, _ = self.model(thermal, extract_features=True)
                 l1_loss = self.base_criterion(pred, visible)
 
-                # PatchNCE: pass generated image BACK through encoder
-                # Convert 3ch pred to 1ch grayscale to match encoder input_nc=1
+                # PatchNCE: pass generated image BACK through encoder.
+                # gen_feats are used only as a fixed reference (gf.detach()),
+                # so no gradient graph is needed through this second forward pass.
                 pred_gray = pred.mean(dim=1, keepdim=True)
-                _, gen_feats, _ = self.model(pred_gray, extract_features=True)
+                with torch.no_grad():
+                    _, gen_feats, _ = self.model(pred_gray, extract_features=True)
 
                 # Compare source thermal features vs generated image features
                 # at same spatial positions — this is what PatchNCE does
-                patch_loss = sum(F.l1_loss(sf, gf.detach())
+                patch_loss = sum(F.l1_loss(sf, gf)
                                  for sf, gf in zip(src_feats, gen_feats))
 
                 # Perceptual: generated vs real visible in VGG space
@@ -605,14 +654,22 @@ if __name__ == '__main__':
     else:
         benchmark_results = {}
 
-    # Batch sizes tuned for Colab A100 (40 GB VRAM) with AMP enabled.
-    # All values are aggressive to maximise GPU utilisation.
+    # Batch sizes for Colab A100 (40 GB VRAM) with AMP (fp16).
+    #
+    # DCNet:  2x generator forward + VGG activations peak at ~22GB for batch 64.
+    #         With the torch.no_grad() fix on the 2nd pass, batch 32 is safe (~11GB).
+    # FWGAN:  Gen and disc run in separate backward passes — peak = one pass at a time.
+    #         Batch 128 tested and worked previously.
+    # VQ-InfraTrans: Transformer attention (B,8,1024,1024) × 6 layers = B×96MB.
+    #         Batch 64 ≈ 6GB for attention alone; 120 was borderline but worked.
+    # Inter-Mamba: SSM intermediate (B,4096,512,16) = B×64MB; batch 32 ≈ 2GB.
+    # Cond-DDPM: UNet bottleneck at 32×32 resolution — lighter than it looks.
     model_configs = {
-        "DCNet":         {"batch_size": 64,  "epochs": 50},
+        "DCNet":         {"batch_size": 32,  "epochs": 50},
         "FWGAN":         {"batch_size": 128, "epochs": 50},
-        "VQ-InfraTrans": {"batch_size": 120, "epochs": 50},
-        "Inter-Mamba":   {"batch_size": 64,  "epochs": 50},
-        "Cond-DDPM":     {"batch_size": 64,  "epochs": 50},
+        "VQ-InfraTrans": {"batch_size": 64,  "epochs": 50},
+        "Inter-Mamba":   {"batch_size": 32,  "epochs": 50},
+        "Cond-DDPM":     {"batch_size": 32,  "epochs": 50},
     }
 
     for model_name, config in model_configs.items():
@@ -625,6 +682,7 @@ if __name__ == '__main__':
             batch_size=config["batch_size"],
             epochs=config["epochs"],
             device="cuda" if torch.cuda.is_available() else "cpu",
+            ckpt_dir=CKPT_DIR,
         )
 
         if os.path.exists(ckpt_path) and model_name in benchmark_results:

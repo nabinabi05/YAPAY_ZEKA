@@ -638,6 +638,11 @@ if __name__ == '__main__':
     RESULTS_PATH = os.environ.get("RESULTS_PATH", "results.json")
     CKPT_DIR     = os.environ.get("CKPT_DIR", "checkpoints")
 
+    # Comma-separated list of model names to force-skip regardless of checkpoints.
+    # Example: %env SKIP_MODELS=FWGAN   or   %env SKIP_MODELS=FWGAN,DCNet
+    _skip_env  = os.environ.get("SKIP_MODELS", "")
+    SKIP_MODELS = {s.strip() for s in _skip_env.split(",") if s.strip()}
+
     if not os.path.exists(THERMAL_DIR) or not os.path.exists(VISIBLE_DIR):
         print(f"Error: Dataset paths missing.\n"
               f"  Thermal : {THERMAL_DIR}\n"
@@ -667,13 +672,17 @@ if __name__ == '__main__':
     model_configs = {
         "DCNet":         {"batch_size": 32,  "epochs": 50},
         "FWGAN":         {"batch_size": 128, "epochs": 50},
-        "VQ-InfraTrans": {"batch_size": 64,  "epochs": 50},
+        "VQ-InfraTrans": {"batch_size": 128, "epochs": 50},
         "Inter-Mamba":   {"batch_size": 32,  "epochs": 50},
         "Cond-DDPM":     {"batch_size": 32,  "epochs": 50},
     }
 
     for model_name, config in model_configs.items():
         ckpt_path = os.path.join(CKPT_DIR, f"{model_name}_final.pth")
+
+        if model_name in SKIP_MODELS:
+            print(f"\n[SKIP] {model_name} — force-skipped via SKIP_MODELS env var.")
+            continue
 
         trainer = UnifiedModelTrainer(
             model_name=model_name,

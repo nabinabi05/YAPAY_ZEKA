@@ -81,13 +81,14 @@ class ThermalVisibleDataset(Dataset):
         return max(self.thermal_size, self.visible_size)
 
 def create_dataloader(thermal_dir, visible_dir, mode="paired", is_train=True,
-                      batch_size=4, num_workers=2, img_size=(256,256), split_ratio=0.8):
-    # num_workers=2 keeps Colab happy; 4+ can stall on the free runtime's CPU.
+                      batch_size=4, num_workers=0, img_size=(256,256), split_ratio=0.8):
+    # num_workers=0 runs data loading in the main process — avoids the
+    # shared-memory / socket FileNotFoundError that kills Colab worker threads.
     dataset = ThermalVisibleDataset(thermal_dir, visible_dir, mode=mode,
                                     is_train=is_train, img_size=img_size, split_ratio=split_ratio)
     return DataLoader(dataset, batch_size=batch_size, shuffle=is_train,
-                      num_workers=num_workers, pin_memory=True, drop_last=is_train,
-                      persistent_workers=(num_workers > 0))
+                      num_workers=num_workers, pin_memory=False, drop_last=is_train,
+                      persistent_workers=False)
 
 
 # --------------------------------------------------------------------------- #

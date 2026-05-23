@@ -53,6 +53,33 @@ python train_and_eval.py
 
 Results will be saved to `results.json` and visual samples will be stored in the `samples/` directory.
 
+### Running on Google Colab
+
+The script reads dataset and output paths from environment variables, so a Drive-mounted dataset works without code changes. Tuned for an A100 (40 GB) instance; reduce batch sizes in `train_and_eval.py` if you fall back to T4/V100.
+
+```python
+# 1. Mount Drive
+from google.colab import drive
+drive.mount('/content/drive')
+
+# 2. Clone the repo and install dependencies
+!git clone <YOUR_REPO_URL> /content/yapay_zeka
+%cd /content/yapay_zeka
+!pip install -r requirements.txt
+
+# 3. Point at your Drive-mounted dataset and a persistent checkpoint dir
+%env LLVIP_ROOT=/content/drive/MyDrive/LLVIP
+%env CKPT_DIR=/content/drive/MyDrive/yapay_zeka_checkpoints
+%env RESULTS_PATH=/content/drive/MyDrive/yapay_zeka_checkpoints/results.json
+
+# 4. Train all five models for 50 epochs each
+!python train_and_eval.py
+```
+
+`LLVIP_ROOT` must contain `infrared/` and `visible/` subfolders. Alternatively, set `THERMAL_DIR` and `VISIBLE_DIR` independently.
+
+If a Colab session disconnects mid-run, just re-run the script: completed models are skipped (checkpoint + JSON entry both present) and crash-recovered models reload weights and re-evaluate without retraining.
+
 ## Repository Structure
 
 - `models/`: Architecture definitions for all five models.

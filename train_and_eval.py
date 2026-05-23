@@ -148,10 +148,13 @@ class UnifiedModelTrainer:
             thermal_dir, visible_dir,
             mode="paired", is_train=True,
             batch_size=batch_size)
+        # Validation uses a small, fixed batch size: DDIM sampling and
+        # multi-head attention blow up VRAM with large eval batches.
+        val_batch_size = min(8, max(batch_size, 1))
         self.val_loader = create_dataloader(
             thermal_dir, visible_dir,
             mode="paired", is_train=False,
-            batch_size=max(batch_size, 1))
+            batch_size=val_batch_size)
 
         self._init_model()
 
@@ -225,11 +228,17 @@ class UnifiedModelTrainer:
     # ---------------------------------------------------------------------- #
 
     def run_training_loop(self) -> dict:
-        history = {"psnr": [], "ssim": [], "mae": [], "rmse": [], "fps": []}
+        history = {"psnr": [], "ssim": [], "mae": [], "rmse": [], "fps": [],
+                   "evaluated_epochs": []}
 
         total_params = sum(p.numel() for p in self.model.parameters()
                            if p.requires_grad)
         print(f"[{self.model_name}] Total Trainable Parameters: {total_params:,}")
+
+        # Cond-DDPM evaluation requires running 50-step DDIM sampling over the
+        # entire val set, which dwarfs training time per epoch. Throttle it to
+        # every 5 epochs + the final epoch.
+        eval_every = 5 if self.model_name == "Cond-DDPM" else 1
 
         for epoch in range(1, self.epochs + 1):
             self.model.train()
@@ -269,10 +278,18 @@ class UnifiedModelTrainer:
                     postfix["ppl"] = f"{self._last_perplexity:.0f}"
                 loop.set_postfix(**postfix)
 
-            metrics = self._run_validation(epoch)
-            self._save_samples(epoch)
-            for k, v in metrics.items():
-                history[k].append(float(v))
+            do_eval = (epoch % eval_every == 0) or (epoch == self.epochs)
+            if do_eval:
+                metrics = self._run_validation(epoch)
+                self._save_samples(epoch)
+                for k, v in metrics.items():
+                    history[k].append(float(v))
+                history["evaluated_epochs"].append(epoch)
+            else:
+                print(f"[{self.model_name}] Epoch {epoch}/{self.epochs} — "
+                      f"skipping eval (next at epoch "
+                      f"{((epoch // eval_every) + 1) * eval_every}); "
+                      f"avg loss: {np.mean(epoch_losses):.4f}")
 
         history["total_parameters"] = total_params
         os.makedirs("checkpoints", exist_ok=True)
@@ -299,6 +316,7 @@ class UnifiedModelTrainer:
             "mae":              [float(metrics["mae"])],
             "rmse":             [float(metrics["rmse"])],
             "fps":              [float(metrics["fps"])],
+            "evaluated_epochs": [self.epochs],
             "total_parameters": total_params,
             "note":             "metrics recovered from checkpoint — no per-epoch history",
         }
@@ -557,10 +575,19 @@ class UnifiedModelTrainer:
 if __name__ == '__main__':
     print("Initiating Unified Generative Framework Training Orchestrator...")
 
-    THERMAL_DIR  = os.path.join("data", "LLVIP", "LLVIP", "infrared")
-    VISIBLE_DIR  = os.path.join("data", "LLVIP", "LLVIP", "visible")
-    RESULTS_PATH = "results.json"
-    CKPT_DIR     = "checkpoints"
+    # Allow overriding paths via environment variables so Colab users can
+    # point at a Drive-mounted dataset / persistent checkpoint dir without
+    # editing source. Example in a Colab cell:
+    #   %env LLVIP_ROOT=/content/drive/MyDrive/LLVIP
+    #   %env CKPT_DIR=/content/drive/MyDrive/checkpoints
+    LLVIP_ROOT   = os.environ.get("LLVIP_ROOT",
+                                   os.path.join("data", "LLVIP", "LLVIP"))
+    THERMAL_DIR  = os.environ.get("THERMAL_DIR",
+                                   os.path.join(LLVIP_ROOT, "infrared"))
+    VISIBLE_DIR  = os.environ.get("VISIBLE_DIR",
+                                   os.path.join(LLVIP_ROOT, "visible"))
+    RESULTS_PATH = os.environ.get("RESULTS_PATH", "results.json")
+    CKPT_DIR     = os.environ.get("CKPT_DIR", "checkpoints")
 
     if not os.path.exists(THERMAL_DIR) or not os.path.exists(VISIBLE_DIR):
         print(f"Error: Dataset paths missing.\n"
@@ -578,11 +605,13 @@ if __name__ == '__main__':
     else:
         benchmark_results = {}
 
+    # Batch sizes tuned for Colab A100 (40 GB VRAM) with AMP enabled.
+    # All values are aggressive to maximise GPU utilisation.
     model_configs = {
-        "DCNet":         {"batch_size": 32,  "epochs": 50},
+        "DCNet":         {"batch_size": 64,  "epochs": 50},
         "FWGAN":         {"batch_size": 128, "epochs": 50},
-        "VQ-InfraTrans": {"batch_size": 120, "epochs": 30},
-        "Inter-Mamba":   {"batch_size": 32,  "epochs": 30},
+        "VQ-InfraTrans": {"batch_size": 120, "epochs": 50},
+        "Inter-Mamba":   {"batch_size": 64,  "epochs": 50},
         "Cond-DDPM":     {"batch_size": 64,  "epochs": 50},
     }
 
@@ -624,6 +653,11 @@ if __name__ == '__main__':
         with open(RESULTS_PATH, "w", encoding="utf-8") as f:
             json.dump(benchmark_results, f, indent=4)
         print(f"[SAVED] '{model_name}' results written to '{RESULTS_PATH}'.")
+
+        # Free GPU memory before mounting the next architecture.
+        del trainer
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     print("\nAll architecture benchmark loops complete.")
     print(f"Final metrics in '{RESULTS_PATH}'.")
@@ -671,6 +705,8 @@ if __name__ == '__main__':
                     p = tmp.model(thermal)
             row.append((p[0].cpu().float() + 1) / 2)
             del tmp
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         row.append((visible[0].cpu() + 1) / 2)
         comparison_images.extend([img.clamp(0, 1) for img in row])

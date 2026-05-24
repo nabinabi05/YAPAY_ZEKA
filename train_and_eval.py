@@ -673,7 +673,7 @@ if __name__ == '__main__':
         "DCNet":         {"batch_size": 32,  "epochs": 50},
         "FWGAN":         {"batch_size": 128, "epochs": 50},
         "VQ-InfraTrans": {"batch_size": 156, "epochs": 50},
-        "Inter-Mamba":   {"batch_size": 32,  "epochs": 50},
+        "Inter-Mamba":   {"batch_size": 48,  "epochs": 50},
         "Cond-DDPM":     {"batch_size": 32,  "epochs": 50},
     }
 

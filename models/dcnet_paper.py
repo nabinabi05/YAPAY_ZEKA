@@ -306,7 +306,7 @@ def main():
     ap.add_argument("--epochs", type=int, default=200)
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--batch", type=int, default=1)
-    ap.add_argument("--patience", type=int, default=15)
+    ap.add_argument("--patience", type=int, default=15, help="early-stop after this many non-improving evals; 0 = never")
     ap.add_argument("--ckpt_dir", default="checkpoints")
     ap.add_argument("--gan_mode", default="vanilla", choices=["vanilla", "lsgan"])
     ap.add_argument("--max_train", type=int, default=0, help="subsample N train images (0=all) — use to fit a deadline")
@@ -314,6 +314,8 @@ def main():
     ap.add_argument("--sample_dir", default="samples/dcnet_paper")
     ap.add_argument("--workers", type=int, default=4, help="DataLoader num_workers (0 on Windows, 4 on Colab/Linux)")
     ap.add_argument("--amp", action="store_true", help="mixed-precision (fp16 activations) — 1.5-2x speedup on A100")
+    ap.add_argument("--resume", default="", help="checkpoint to continue from: full DCNet_paper_ckpt.pth (clean) "
+                                                 "or generator-only DCNet_paper_best.pth (D/F/optim reinit)")
     a = ap.parse_args()
     from data.dataset import create_dataloader, ThermalVisibleDataset
     from torch.utils.data import DataLoader, Subset
@@ -355,7 +357,31 @@ def main():
 
     best_ssim, best_epoch, no_improve = -1.0, 0, 0
     best_path = os.path.join(a.ckpt_dir, "DCNet_paper_best.pth")
-    for epoch in range(1, a.epochs + 1):
+    ckpt_path = os.path.join(a.ckpt_dir, "DCNet_paper_ckpt.pth")   # full training state (for clean resume)
+    start_epoch = 1
+
+    if a.resume:
+        assert os.path.isfile(a.resume), f"--resume {a.resume} not found"
+        ck = torch.load(a.resume, map_location=device)
+        if isinstance(ck, dict) and "G" in ck and "optG" in ck:        # full checkpoint -> clean resume
+            G.load_state_dict(ck["G"]); D.load_state_dict(ck["D"]); Fnet.load_state_dict(ck["F"])
+            optG.load_state_dict(ck["optG"]); optD.load_state_dict(ck["optD"]); optF.load_state_dict(ck["optF"])
+            scaler.load_state_dict(ck["scaler"])
+            best_ssim   = ck.get("best_ssim", -1.0)
+            best_epoch  = ck.get("best_epoch", 0)
+            no_improve  = ck.get("no_improve", 0)
+            start_epoch = ck.get("epoch", 0) + 1
+            print(f"[resume] FULL checkpoint @ epoch {ck.get('epoch')} (best {best_ssim:.4f} @ {best_epoch}); "
+                  f"continuing at epoch {start_epoch}, no_improve={no_improve}")
+        else:                                                          # generator-only (e.g. *_best.pth)
+            G.load_state_dict(ck["G"] if isinstance(ck, dict) and "G" in ck else ck)
+            best_ssim = evaluate_ssim(G, val_loader, device, n_max=a.eval_n)   # seed floor: protect the loaded best
+            best_epoch = start_epoch - 1
+            print(f"[resume] GENERATOR weights only (val SSIM {best_ssim:.4f}) — D, PatchSampleF and all "
+                  "optimizers are REINITIALIZED. Expect a transient dip for several epochs while D re-learns; "
+                  "the existing best.pth is protected and only overwritten if genuinely beaten.")
+
+    for epoch in range(start_epoch, a.epochs + 1):
         G.train(); D.train()
         for b in train_loader:
             real_A = b["thermal"].to(device).repeat(1, 3, 1, 1)   # IR as 3-channel
@@ -393,9 +419,16 @@ def main():
             print(f"  [BEST] val SSIM {val_ssim:.4f} -> {best_path}  (+ sample grid)")
         else:
             no_improve += 1
-            if no_improve >= a.patience:
-                print(f"  [EARLY-STOP] best {best_ssim:.4f} @ epoch {best_epoch}")
-                break
+
+        # full training state every epoch so --resume can continue cleanly (G+D+F+optims+scaler)
+        torch.save({"G": G.state_dict(), "D": D.state_dict(), "F": Fnet.state_dict(),
+                    "optG": optG.state_dict(), "optD": optD.state_dict(), "optF": optF.state_dict(),
+                    "scaler": scaler.state_dict(), "epoch": epoch,
+                    "best_ssim": best_ssim, "best_epoch": best_epoch, "no_improve": no_improve}, ckpt_path)
+
+        if a.patience and no_improve >= a.patience:                   # patience=0 disables early-stop
+            print(f"  [EARLY-STOP] best {best_ssim:.4f} @ epoch {best_epoch}")
+            break
     print(f"Done. Best val SSIM {best_ssim:.4f} @ epoch {best_epoch} (paper reports ~0.584).")
 
 

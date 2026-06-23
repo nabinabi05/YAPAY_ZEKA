@@ -177,14 +177,18 @@ class PatchNCELoss(nn.Module):
         self.ce = nn.CrossEntropyLoss()
 
     def forward(self, q, k):                                      # q,k: (B, P, C)
-        q, k = q.float(), k.float()                               # fp32: -1e9 mask overflows fp16 under AMP
-        B, P, _ = q.shape
-        l_pos = (q * k).sum(dim=-1, keepdim=True)                 # (B,P,1)
-        l_neg = torch.bmm(q, k.transpose(1, 2))                   # (B,P,P) within-image
-        l_neg = l_neg.masked_fill(torch.eye(P, device=q.device, dtype=torch.bool)[None], -1e9)
-        logits = torch.cat([l_pos, l_neg], dim=-1).reshape(B * P, 1 + P) / self.tau
-        labels = torch.zeros(B * P, dtype=torch.long, device=q.device)
-        return self.ce(logits, labels)
+        # Disable autocast: bmm is on autocast's fp16 allowlist, so it would
+        # re-cast even an explicit .float() back to fp16 and the -1e9 mask
+        # would overflow. Run the whole InfoNCE in true fp32 (AMP best practice).
+        with torch.amp.autocast(device_type='cuda' if q.is_cuda else 'cpu', enabled=False):
+            q, k = q.float(), k.float()
+            B, P, _ = q.shape
+            l_pos = (q * k).sum(dim=-1, keepdim=True)             # (B,P,1)
+            l_neg = torch.bmm(q, k.transpose(1, 2))               # (B,P,P) within-image
+            l_neg = l_neg.masked_fill(torch.eye(P, device=q.device, dtype=torch.bool)[None], -1e9)
+            logits = torch.cat([l_pos, l_neg], dim=-1).reshape(B * P, 1 + P) / self.tau
+            labels = torch.zeros(B * P, dtype=torch.long, device=q.device)
+            return self.ce(logits, labels)
 
 
 # ===================================================================== #

@@ -1,0 +1,895 @@
+import os
+import json
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.amp import GradScaler, autocast
+from tqdm import tqdm
+
+torch.backends.cudnn.benchmark     = True
+torch.backends.cudnn.deterministic = False
+
+from skimage.metrics import structural_similarity as ssim
+from skimage.metrics import peak_signal_noise_ratio as psnr
+from torchvision.utils import make_grid, save_image
+
+from data.dataset import create_dataloader
+from models.dc_net import DCNet, NLayerDiscriminator
+from models.diffusion_model import ThermalToVisibleDDPM, ConditionalUNet
+from models.fwgan import FWGANArchive
+from models.vq_infratrans import VQInfraTrans
+from models.mamba_fusion import InterMambaBlock
+
+
+class ReplayBuffer:
+    def __init__(self, max_size=50):
+        self.max_size = max_size
+        self.data = []
+    def push_and_pop(self, batch):
+        result = []
+        for elem in batch:
+            if len(self.data) < self.max_size:
+                self.data.append(elem)
+                result.append(elem)
+            elif np.random.rand() > 0.5:
+                idx = np.random.randint(0, self.max_size)
+                result.append(self.data[idx].clone())
+                self.data[idx] = elem
+            else:
+                result.append(elem)
+        return torch.stack(result)
+
+
+# --------------------------------------------------------------------------- #
+# Mamba proxy wrapper
+# --------------------------------------------------------------------------- #
+
+class MambaTranslatorProxy(nn.Module):
+    """
+    Multi-scale encoder-decoder wrapping the InterMambaBlock.
+
+    FIX: Expanded from 91K to ~2M parameters with a proper 3-level
+    encoder-decoder and skip connections.  The SSM block operates at the
+    bottleneck resolution (H/4, W/4) for efficiency.
+
+    WARNING: Both 'visible' and 'thermal' SSM inputs are still derived from
+    the same thermal encoder.  A proper cross-modal implementation would
+    require separate encoder streams.
+    """
+    def __init__(self):
+        super().__init__()
+        # Multi-scale encoder: 1 → 64 → 128 → 256
+        self.enc1 = nn.Sequential(
+            nn.Conv2d(1, 64, 3, padding=1, bias=False),
+            nn.InstanceNorm2d(64, affine=True), nn.SiLU())
+        self.enc2 = nn.Sequential(
+            nn.Conv2d(64, 128, 3, stride=2, padding=1, bias=False),
+            nn.InstanceNorm2d(128, affine=True), nn.SiLU())
+        self.enc3 = nn.Sequential(
+            nn.Conv2d(128, 256, 3, stride=2, padding=1, bias=False),
+            nn.InstanceNorm2d(256, affine=True), nn.SiLU())
+
+        # SSM fusion at bottleneck
+        self.mamba = InterMambaBlock(dim=256)
+
+        # Decoder with skip connections
+        self.dec1 = nn.Sequential(
+            nn.ConvTranspose2d(512, 128, 4, stride=2, padding=1, bias=False),
+            nn.InstanceNorm2d(128, affine=True), nn.SiLU(), nn.Dropout(0.1))
+        self.dec2 = nn.Sequential(
+            nn.ConvTranspose2d(256, 64, 4, stride=2, padding=1, bias=False),
+            nn.InstanceNorm2d(64, affine=True), nn.SiLU(), nn.Dropout(0.1))
+        self.out = nn.Sequential(
+            nn.Conv2d(128, 3, 3, padding=1), nn.Tanh())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        e1 = self.enc1(x)
+        e2 = self.enc2(e1)
+        e3 = self.enc3(e2)
+        m  = self.mamba(visible=e3, thermal=e3)
+        d1 = self.dec1(torch.cat([m, e3], dim=1))
+        d2 = self.dec2(torch.cat([d1, e2], dim=1))
+        return self.out(torch.cat([d2, e1], dim=1))
+
+
+# --------------------------------------------------------------------------- #
+# Metric computation
+# --------------------------------------------------------------------------- #
+
+def evaluate_batch_metrics(pred_tensor: torch.Tensor,
+                            target_tensor: torch.Tensor):
+    """
+    Computes PSNR, SSIM, MAE, and MSE on a batch of [-1, 1] tensors.
+    Returns raw MSE — RMSE is computed at epoch level as sqrt(mean(all_mse)).
+    """
+    pred   = ((pred_tensor   + 1.0) / 2.0).clamp(0, 1).cpu().numpy()
+    target = ((target_tensor + 1.0) / 2.0).clamp(0, 1).cpu().numpy()
+
+    psnr_list, ssim_list, mae_list, mse_list = [], [], [], []
+
+    for i in range(pred.shape[0]):
+        p_img = np.transpose(pred[i],   (1, 2, 0))
+        t_img = np.transpose(target[i], (1, 2, 0))
+        psnr_list.append(psnr(t_img, p_img, data_range=1.0))
+        ssim_list.append(ssim(t_img, p_img, data_range=1.0, channel_axis=2))
+        mae_list.append(np.mean(np.abs(t_img - p_img)))
+        mse_list.append(np.mean((t_img - p_img) ** 2))
+
+    return (np.mean(psnr_list),
+            np.mean(ssim_list),
+            np.mean(mae_list),
+            np.mean(mse_list))
+
+
+# --------------------------------------------------------------------------- #
+# Dataset split resolution
+# --------------------------------------------------------------------------- #
+
+def resolve_official_splits(thermal_dir, visible_dir):
+    """Return ((train_t, train_v), (val_t, val_v)) using the official LLVIP
+    train/ and test/ subfolders when they exist.
+
+    This prevents the train/test LEAKAGE that occurs when a single parent
+    folder containing BOTH train/ and test/ is handed to a ratio split: a
+    recursive file walk merges the two folders and the official test images
+    end up inside the training slice. Returns None when no such subfolders
+    exist, signalling the caller to fall back to a ratio split of one folder.
+    """
+    t_tr, t_te = os.path.join(thermal_dir, "train"), os.path.join(thermal_dir, "test")
+    v_tr, v_te = os.path.join(visible_dir, "train"), os.path.join(visible_dir, "test")
+    if all(os.path.isdir(d) for d in (t_tr, t_te, v_tr, v_te)):
+        return (t_tr, v_tr), (t_te, v_te)
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# Unified trainer
+# --------------------------------------------------------------------------- #
+
+class UnifiedModelTrainer:
+    """
+    Unified training and evaluation pipeline for all five architectures.
+    """
+
+    def __init__(self, model_name: str, thermal_dir: str, visible_dir: str,
+                 batch_size: int = 4, epochs: int = 5, device: str = "cuda",
+                 ckpt_dir: str = "checkpoints",
+                 patience: int = 10, min_delta: float = 1e-3):
+        self.device     = torch.device(device if torch.cuda.is_available() else "cpu")
+        self.model_name = model_name
+        self.epochs     = epochs
+        self.use_amp    = self.device.type == "cuda"
+        self.ckpt_dir   = ckpt_dir
+        self.patience   = patience      # early-stop after this many evals w/o val-SSIM gain
+        self.min_delta  = min_delta     # minimum val-SSIM gain counted as improvement
+        os.makedirs(ckpt_dir, exist_ok=True)
+
+        print(f"Initializing DataLoader hooks for benchmark task: {model_name}...")
+
+        # Prefer the official LLVIP train/ and test/ folders so the two splits
+        # can NEVER leak into one another. Train uses augmentation + shuffle;
+        # validation uses the untouched official test set.
+        # pin_memory, num_workers, persistent_workers are handled in dataset.py.
+        val_batch_size = min(8, max(batch_size, 1))   # DDIM/attention eval is VRAM-heavy
+        splits = resolve_official_splits(thermal_dir, visible_dir)
+        if splits is not None:
+            (tr_t, tr_v), (va_t, va_v) = splits
+            print(f"[data] Official LLVIP split detected — no leakage:\n"
+                  f"       train -> {tr_t}\n"
+                  f"       val   -> {va_t}   (official test set, held out)")
+            self.train_loader = create_dataloader(
+                tr_t, tr_v, mode="paired", is_train=True,
+                batch_size=batch_size, split_ratio=None)
+            self.val_loader = create_dataloader(
+                va_t, va_v, mode="paired", is_train=False,
+                batch_size=val_batch_size, split_ratio=None)
+        else:
+            print("[data][WARN] No train/ and test/ subfolders under the given paths; "
+                  "falling back to an 80/20 ratio split of a single folder. Make sure "
+                  "that folder does not itself contain separate train/test subfolders, "
+                  "or they will be merged and leak.")
+            self.train_loader = create_dataloader(
+                thermal_dir, visible_dir, mode="paired", is_train=True,
+                batch_size=batch_size, split_ratio=0.8)
+            self.val_loader = create_dataloader(
+                thermal_dir, visible_dir, mode="paired", is_train=False,
+                batch_size=val_batch_size, split_ratio=0.8)
+
+        self._init_model()
+
+    # ---------------------------------------------------------------------- #
+    # Model + optimiser initialisation
+    # ---------------------------------------------------------------------- #
+
+    def _init_model(self):
+        print(f"Mounting [{self.model_name}] architecture to Device: {self.device}")
+
+        self.opts    = {}
+        self.scalers = {}
+        GAN_BETAS    = (0.5, 0.999)
+
+        if self.model_name == "DCNet":
+            # res_dropout regularizes the bottleneck; weight_decay on the generator
+            # optimizer adds L2 regularization. Both directly fight memorization.
+            self.model = DCNet(input_nc=1, output_nc=3, res_dropout=0.3).to(self.device)
+            self.opts['main']   = optim.Adam(self.model.parameters(), lr=2e-4,
+                                             betas=GAN_BETAS, weight_decay=1e-4)
+            # Conditional PatchGAN discriminator (adversarial realism, not a
+            # generalization fix on its own) + its own optimizer/scaler/scheduler
+            # (auto-created from self.opts keys below).
+            self.discriminator = NLayerDiscriminator(input_nc=1 + 3).to(self.device)
+            self.opts['disc']  = optim.Adam(self.discriminator.parameters(), lr=1e-4,
+                                            betas=GAN_BETAS)
+            self.base_criterion = nn.L1Loss()
+            self.adv_criterion  = nn.MSELoss()   # LSGAN: stable, no sigmoid
+            # Tunable loss weights. L1 is raised so the GAN can't trade away the
+            # structural fidelity that SSIM measures.
+            self.lambda_l1, self.lambda_patch, self.lambda_perc, self.lambda_adv = \
+                10.0, 1.0, 10.0, 1.0
+
+        elif self.model_name == "Cond-DDPM":
+            unet       = ConditionalUNet(c_in=4, c_out=3)
+            self.model = ThermalToVisibleDDPM(network=unet, T=1000, schedule='cosine').to(self.device)
+            self.opts['main']   = optim.Adam(self.model.parameters(), lr=1e-4)
+            self.base_criterion = nn.MSELoss()
+
+        elif self.model_name == "FWGAN":
+            self.model = FWGANArchive(input_nc=1, output_nc=3).to(self.device)
+            self.model.lambda_temp = 0.0  # ADD THIS LINE — disables temporal loss
+            self.opts['gen']  = optim.Adam(
+                self.model.generator.parameters(),     lr=2e-4, betas=(0.5, 0.999))
+            self.opts['disc'] = optim.Adam(
+                self.model.discriminator.parameters(), lr=1e-4, betas=(0.5, 0.999))  # TTUR
+            self.fake_buffer = ReplayBuffer(max_size=50)
+
+        elif self.model_name == "VQ-InfraTrans":
+            self.model = VQInfraTrans(input_nc=1, output_nc=3).to(self.device)
+            self.opts['main']   = optim.Adam(self.model.parameters(), lr=1e-4, betas=(0.5, 0.999))
+            self.base_criterion = nn.L1Loss()
+
+        elif self.model_name == "Inter-Mamba":
+            self.model = MambaTranslatorProxy().to(self.device)
+            self.opts['main']   = optim.Adam(self.model.parameters(), lr=2e-4)
+            self.base_criterion = nn.L1Loss()
+
+        else:
+            raise ValueError(f"Unknown model name: '{self.model_name}'")
+
+        for key in self.opts:
+            self.scalers[key] = GradScaler('cuda', enabled=self.use_amp)
+
+        self.schedulers = {}
+        self._step_count = 0
+        steps_per_epoch = len(self.train_loader)
+        total_steps = self.epochs * steps_per_epoch
+        for key, opt in self.opts.items():
+            def lr_lambda(step, ts=total_steps):
+                decay_start = ts // 2
+                if step < decay_start:
+                    return 1.0
+                return max(0.0, 1.0 - (step - decay_start) / (ts - decay_start))
+            self.schedulers[key] = optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_lambda)
+
+    def load_checkpoint(self, ckpt_path: str):
+        """Loads saved weights into the model (used for validation-only recovery)."""
+        data = torch.load(ckpt_path, map_location=self.device)
+        # Accept both bare state_dict and wrapped checkpoint dicts
+        state = data.get("model_state", data)
+        self.model.load_state_dict(state)
+        print(f"[LOADED] Weights restored from '{ckpt_path}'")
+
+    # ---------------------------------------------------------------------- #
+    # Training loop
+    # ---------------------------------------------------------------------- #
+
+    def run_training_loop(self) -> dict:
+        history = {"psnr": [], "ssim": [], "mae": [], "rmse": [], "fps": [],
+                   "evaluated_epochs": []}
+        start_epoch = 1
+
+        total_params = sum(p.numel() for p in self.model.parameters()
+                           if p.requires_grad)
+        print(f"[{self.model_name}] Total Trainable Parameters: {total_params:,}")
+
+        # ── Resume from partial checkpoint if one exists ──────────────────── #
+        partial_path = os.path.join(self.ckpt_dir, f"{self.model_name}_partial.pth")
+        if os.path.exists(partial_path):
+            print(f"[RESUME] Found partial checkpoint — continuing from saved epoch.")
+            ckpt = torch.load(partial_path, map_location=self.device)
+            self.model.load_state_dict(ckpt["model_state"])
+            for k, opt in self.opts.items():
+                if k in ckpt["opts_state"]:
+                    opt.load_state_dict(ckpt["opts_state"][k])
+            for k, sched in self.schedulers.items():
+                if k in ckpt["schedulers_state"]:
+                    sched.load_state_dict(ckpt["schedulers_state"][k])
+            for k, scaler in self.scalers.items():
+                if k in ckpt["scalers_state"]:
+                    scaler.load_state_dict(ckpt["scalers_state"][k])
+            history          = ckpt["history"]
+            self._step_count = ckpt["step_count"]
+            start_epoch      = ckpt["epoch"] + 1
+            print(f"[RESUME] Resuming from epoch {start_epoch}/{self.epochs}")
+
+        # Cond-DDPM evaluation requires running 50-step DDIM sampling over the
+        # entire val set, which dwarfs training time per epoch. Throttle it to
+        # every 5 epochs + the final epoch.
+        eval_every      = 5 if self.model_name == "Cond-DDPM" else 1
+        checkpoint_every = 5   # save partial checkpoint every N epochs
+
+        # ── Early stopping on the (now honest) validation SSIM ────────────── #
+        best_ssim        = max(history["ssim"]) if history.get("ssim") else float("-inf")
+        best_epoch       = 0
+        evals_no_improve = 0
+        best_path        = os.path.join(self.ckpt_dir, f"{self.model_name}_best.pth")
+
+        for epoch in range(start_epoch, self.epochs + 1):
+            self.model.train()
+            loop = tqdm(self.train_loader, desc=f"Epoch [{epoch}/{self.epochs}]")
+
+            prev_pred_f    = None
+            prev_target_f  = None
+            prev_thermal_f = None
+            epoch_losses   = []
+
+            for batch in loop:
+                thermal = batch['thermal'].to(self.device)
+                visible = batch['visible'].to(self.device)
+
+                loss_val = self._training_step(
+                    thermal, visible,
+                    prev_pred_f, prev_target_f, prev_thermal_f)
+
+                if self.model_name == "FWGAN":
+                    with torch.no_grad():
+                        prev_pred_f = self.model.forward_generate(
+                            thermal,
+                            prev_thermal_f,
+                            prev_pred_f.detach() if prev_pred_f is not None else None
+                        ).detach()
+                    prev_target_f  = visible.detach()
+                    prev_thermal_f = thermal.detach()
+
+                epoch_losses.append(loss_val)
+
+                for sched in self.schedulers.values():
+                    sched.step()
+                self._step_count += 1
+
+                postfix = {"loss": f"{np.mean(epoch_losses[-10:]):.3f}"}
+                if hasattr(self, '_last_perplexity'):
+                    postfix["ppl"] = f"{self._last_perplexity:.0f}"
+                loop.set_postfix(**postfix)
+
+            do_eval = (epoch % eval_every == 0) or (epoch == self.epochs)
+            if do_eval:
+                metrics = self._run_validation(epoch)
+                self._save_samples(epoch)
+                for k, v in metrics.items():
+                    history[k].append(float(v))
+                history["evaluated_epochs"].append(epoch)
+
+                # ── Best-checkpoint tracking + early stopping ────────────── #
+                cur_ssim = float(metrics["ssim"])
+                if cur_ssim > best_ssim + self.min_delta:
+                    best_ssim, best_epoch, evals_no_improve = cur_ssim, epoch, 0
+                    torch.save(self.model.state_dict(), best_path)
+                    print(f"[BEST] epoch {epoch}: val SSIM {cur_ssim:.4f} → saved {best_path}")
+                else:
+                    evals_no_improve += 1
+                    print(f"[EARLY-STOP] val SSIM {cur_ssim:.4f} did not beat best "
+                          f"{best_ssim:.4f} (@ epoch {best_epoch}); "
+                          f"{evals_no_improve}/{self.patience} evals without gain.")
+                    if self.patience and evals_no_improve >= self.patience:
+                        print(f"[EARLY-STOP] Stopping at epoch {epoch}. "
+                              f"Best val SSIM {best_ssim:.4f} @ epoch {best_epoch}.")
+                        break
+            else:
+                print(f"[{self.model_name}] Epoch {epoch}/{self.epochs} — "
+                      f"skipping eval (next at epoch "
+                      f"{((epoch // eval_every) + 1) * eval_every}); "
+                      f"avg loss: {np.mean(epoch_losses):.4f}")
+
+            # ── Partial checkpoint every N epochs (enables crash recovery) ── #
+            if epoch % checkpoint_every == 0 and epoch < self.epochs:
+                partial_path = os.path.join(self.ckpt_dir,
+                                            f"{self.model_name}_partial.pth")
+                torch.save({
+                    "epoch":            epoch,
+                    "model_state":      self.model.state_dict(),
+                    "opts_state":       {k: o.state_dict() for k, o in self.opts.items()},
+                    "schedulers_state": {k: s.state_dict() for k, s in self.schedulers.items()},
+                    "scalers_state":    {k: s.state_dict() for k, s in self.scalers.items()},
+                    "history":          history,
+                    "step_count":       self._step_count,
+                }, partial_path)
+                print(f"[CKPT] Partial checkpoint saved at epoch {epoch} → {partial_path}")
+
+        history["total_parameters"] = total_params
+        history["best_ssim"]        = best_ssim if best_ssim != float("-inf") else None
+        history["best_epoch"]       = best_epoch
+        ckpt_path = os.path.join(self.ckpt_dir, f"{self.model_name}_final.pth")
+        torch.save(self.model.state_dict(), ckpt_path)
+        print(f"Saved last-epoch weights -> {ckpt_path}")
+        if os.path.exists(best_path):
+            print(f"[BEST] Use this for evaluation: {best_path} "
+                  f"(val SSIM {best_ssim:.4f} @ epoch {best_epoch}). "
+                  f"'_final' is the last epoch and may be more overfit.")
+
+        # Clean up partial checkpoint now that training is complete
+        partial_path = os.path.join(self.ckpt_dir, f"{self.model_name}_partial.pth")
+        if os.path.exists(partial_path):
+            os.remove(partial_path)
+            print(f"[CKPT] Partial checkpoint removed (training complete).")
+
+        return history
+
+    def run_validation_only(self) -> dict:
+        """
+        Runs a single validation pass on a pre-loaded checkpoint.
+        Used to recover metrics when a checkpoint exists but results.json
+        has no entry for this model (i.e. training completed but the run
+        crashed before writing JSON).
+        """
+        total_params = sum(p.numel() for p in self.model.parameters()
+                           if p.requires_grad)
+        print(f"[{self.model_name}] Total Trainable Parameters: {total_params:,}")
+        metrics = self._run_validation(epoch=self.epochs)
+        history = {
+            "psnr":             [float(metrics["psnr"])],
+            "ssim":             [float(metrics["ssim"])],
+            "mae":              [float(metrics["mae"])],
+            "rmse":             [float(metrics["rmse"])],
+            "fps":              [float(metrics["fps"])],
+            "evaluated_epochs": [self.epochs],
+            "total_parameters": total_params,
+            "note":             "metrics recovered from checkpoint — no per-epoch history",
+        }
+        return history
+
+    # ---------------------------------------------------------------------- #
+    # Per-batch training step
+    # ---------------------------------------------------------------------- #
+
+    def _training_step(self, thermal, visible,
+                       prev_pred_f, prev_target_f, prev_thermal_f) -> float:
+
+        if self.model_name == "FWGAN":
+            # Step 1: Discriminator
+            self.opts['disc'].zero_grad()
+            with autocast('cuda', enabled=self.use_amp):
+                pred_t    = self.model.forward_generate(
+                    thermal, prev_thermal_f,
+                    prev_pred_f.detach() if prev_pred_f is not None else None)
+                
+                pred_t_buffered = self.fake_buffer.push_and_pop(pred_t.detach())
+                
+                zeros_th  = torch.zeros_like(thermal)
+                zeros_vis = torch.zeros_like(visible)
+                if prev_thermal_f is None:
+                    disc_fake = self.model.discriminator(
+                        thermal, pred_t_buffered, zeros_th, zeros_vis)
+                    disc_real = self.model.discriminator(
+                        thermal, visible, zeros_th, zeros_vis)
+                else:
+                    disc_fake = self.model.discriminator(
+                        thermal, pred_t_buffered, prev_thermal_f, prev_pred_f.detach())
+                    disc_real = self.model.discriminator(
+                        thermal, visible, prev_thermal_f, prev_target_f)
+                d_loss, _ = self.model.compute_discriminator_losses(disc_real, disc_fake)
+
+            self.scalers['disc'].scale(d_loss).backward()
+            self.scalers['disc'].unscale_(self.opts['disc'])
+            torch.nn.utils.clip_grad_norm_(self.model.discriminator.parameters(), 1.0)
+            self.scalers['disc'].step(self.opts['disc'])
+            self.scalers['disc'].update()
+
+            # Step 2: Generator
+            self.opts['gen'].zero_grad()
+            with autocast('cuda', enabled=self.use_amp):
+                if prev_thermal_f is None:
+                    disc_for_gen = self.model.discriminator(
+                        thermal, pred_t, zeros_th, zeros_vis)
+                else:
+                    disc_for_gen = self.model.discriminator(
+                        thermal, pred_t, prev_thermal_f, prev_pred_f.detach())
+                g_loss, _ = self.model.compute_generator_losses(
+                    pred_t, visible, prev_pred_f, prev_target_f, disc_for_gen)
+
+            self.scalers['gen'].scale(g_loss).backward()
+            self.scalers['gen'].unscale_(self.opts['gen'])
+            torch.nn.utils.clip_grad_norm_(self.model.generator.parameters(), 1.0)
+            self.scalers['gen'].step(self.opts['gen'])
+            self.scalers['gen'].update()
+            return g_loss.item()
+
+        elif self.model_name == "Cond-DDPM":
+            self.opts['main'].zero_grad()
+            with autocast('cuda', enabled=self.use_amp):
+                true_noise, pred_noise, snr_weights = self.model(visible, thermal)
+                # Min-SNR weighted MSE — prevents gradient conflicts across timesteps
+                loss = (snr_weights * F.mse_loss(pred_noise, true_noise, reduction='none')).mean()
+            self.scalers['main'].scale(loss).backward()
+            self.scalers['main'].unscale_(self.opts['main'])
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            self.scalers['main'].step(self.opts['main'])
+            self.scalers['main'].update()
+            return loss.item()
+
+        elif self.model_name == "VQ-InfraTrans":
+            self.opts['main'].zero_grad()
+            with autocast('cuda', enabled=self.use_amp):
+                pred, vq_loss, perplexity = self.model(thermal)
+                loss = self.base_criterion(pred, visible) + vq_loss
+            self.scalers['main'].scale(loss).backward()
+            self.scalers['main'].unscale_(self.opts['main'])
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            self.scalers['main'].step(self.opts['main'])
+            self.scalers['main'].update()
+            self._last_perplexity = perplexity.item()
+            return loss.item()
+
+        elif self.model_name == "DCNet":
+            # ── (1) Discriminator step — conditional PatchGAN, LSGAN ───────── #
+            self.opts['disc'].zero_grad()
+            with autocast('cuda', enabled=self.use_amp):
+                with torch.no_grad():                       # G frozen for the D update
+                    pred_det = self.model(thermal, extract_features=False)
+                d_real = self.discriminator(torch.cat([thermal, visible],  dim=1))
+                d_fake = self.discriminator(torch.cat([thermal, pred_det], dim=1))
+                d_loss = 0.5 * (self.adv_criterion(d_real, torch.ones_like(d_real)) +
+                                self.adv_criterion(d_fake, torch.zeros_like(d_fake)))
+            self.scalers['disc'].scale(d_loss).backward()
+            self.scalers['disc'].step(self.opts['disc'])
+            self.scalers['disc'].update()
+
+            # ── (2) Generator step ─────────────────────────────────────────── #
+            self.opts['main'].zero_grad()
+            with autocast('cuda', enabled=self.use_amp):
+                # Forward: thermal -> generated visible + encoder features
+                pred, src_feats, _ = self.model(thermal, extract_features=True)
+                l1_loss = self.base_criterion(pred, visible)
+
+                # Feature-consistency term: re-encode the generated image and match
+                # it to the thermal encoder features (reference detached, no graph).
+                pred_gray = pred.mean(dim=1, keepdim=True)
+                with torch.no_grad():
+                    _, gen_feats, _ = self.model(pred_gray, extract_features=True)
+                patch_loss = sum(F.l1_loss(sf, gf)
+                                 for sf, gf in zip(src_feats, gen_feats))
+
+                # Perceptual: generated vs real visible in VGG space
+                target_vgg = self.model.perceptual_guidance(visible)
+                pred_vgg = self.model.perceptual_guidance(pred)
+                perc_loss = sum(F.l1_loss(pv, tv.detach())
+                                for pv, tv in zip(pred_vgg, target_vgg))
+
+                # Adversarial: fool D (LSGAN -> push fake logits toward the real label)
+                d_fake_for_g = self.discriminator(torch.cat([thermal, pred], dim=1))
+                adv_loss = self.adv_criterion(d_fake_for_g, torch.ones_like(d_fake_for_g))
+
+                loss = (self.lambda_l1    * l1_loss +
+                        self.lambda_patch * patch_loss +
+                        self.lambda_perc  * perc_loss +
+                        self.lambda_adv   * adv_loss)
+
+            self.scalers['main'].scale(loss).backward()
+            self.scalers['main'].unscale_(self.opts['main'])
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            self.scalers['main'].step(self.opts['main'])
+            self.scalers['main'].update()
+            return loss.item()
+
+        else:  # Inter-Mamba proxy
+            self.opts['main'].zero_grad()
+            with autocast('cuda', enabled=self.use_amp):
+                pred = self.model(thermal)
+                loss = self.base_criterion(pred, visible)
+            self.scalers['main'].scale(loss).backward()
+            self.scalers['main'].unscale_(self.opts['main'])
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            self.scalers['main'].step(self.opts['main'])
+            self.scalers['main'].update()
+            return loss.item()
+
+    # ---------------------------------------------------------------------- #
+    # Validation pass
+    # ---------------------------------------------------------------------- #
+
+    @torch.no_grad()
+    def _run_validation(self, epoch: int) -> dict:
+        self.model.eval()
+        print(f"\n--- Running Evaluation Suite for Epoch {epoch} ---")
+
+        psnr_list, ssim_list, mae_list, mse_list, inference_times = [], [], [], [], []
+        prev_pred_val    = None
+        prev_thermal_val = None
+
+        for batch in self.val_loader:
+            thermal = batch['thermal'].to(self.device)
+            visible = batch['visible'].to(self.device)
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            t0 = time.time()
+
+            with autocast('cuda', enabled=self.use_amp):
+                if self.model_name == "Cond-DDPM":
+                    pred = self.model.sample_ddim(
+                        thermal,
+                        shape=(thermal.shape[0], 3, thermal.shape[2], thermal.shape[3]),
+                        ddim_steps=50)
+
+                elif self.model_name == "FWGAN":
+                    B = thermal.shape[0]
+                    # Guard against batch-size shrinkage on the last batch:
+                    # slice stored buffers down to B, or zero-init if first batch.
+                    if prev_thermal_val is not None and prev_thermal_val.shape[0] != B:
+                        prev_thermal_val = prev_thermal_val[:B]
+                    if prev_pred_val is not None and prev_pred_val.shape[0] != B:
+                        prev_pred_val = prev_pred_val[:B]
+
+                    pred = self.model.forward_generate(
+                        thermal,
+                        prev_thermal_val if prev_thermal_val is not None
+                                        else torch.zeros_like(thermal),
+                        prev_pred_val    if prev_pred_val    is not None
+                                        else torch.zeros_like(visible))
+                    prev_pred_val    = pred.detach()
+                    prev_thermal_val = thermal.detach()
+
+                elif self.model_name == "VQ-InfraTrans":
+                    pred, _, _ = self.model(thermal)
+
+                elif self.model_name == "DCNet":
+                    pred = self.model(thermal, extract_features=False)
+
+                else:
+                    pred = self.model(thermal)
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            inference_times.append((time.time() - t0) / thermal.shape[0])
+
+            b_psnr, b_ssim, b_mae, b_mse = evaluate_batch_metrics(pred, visible)
+            psnr_list.append(b_psnr)
+            ssim_list.append(b_ssim)
+            mae_list.append(b_mae)
+            mse_list.append(b_mse)
+
+        final_psnr = np.mean(psnr_list)
+        final_ssim = np.mean(ssim_list)
+        final_mae  = np.mean(mae_list)
+        final_rmse = np.sqrt(np.mean(mse_list))
+        avg_time   = np.mean(inference_times)
+        fps        = 1.0 / avg_time if avg_time > 0 else 0.0
+
+        print(f"--- [Evaluation Results] Epoch {epoch} Metrics ---")
+        print(f"| Model      : {self.model_name}")
+        print(f"| Mean PSNR  : {final_psnr:.4f} dB (Higher reflects greater pixel fidelity)")
+        print(f"| Mean SSIM  : {final_ssim:.4f} (Closer to 1.0 reflects identical contextual structure)")
+        print(f"| Mean MAE   : {final_mae:.4f} (Lower is better)")
+        print(f"| Mean RMSE  : {final_rmse:.4f} (Lower is better)")
+        print(f"| Inference  : {avg_time*1000:.2f} ms/image ({fps:.2f} FPS)")
+        print("--------------------------------------------------\n")
+
+        return {"psnr": final_psnr, "ssim": final_ssim,
+                "mae": final_mae,   "rmse": final_rmse, "fps": fps}
+
+    def _save_samples(self, epoch):
+        """Save visual samples: thermal | generated | ground truth for first 4 val images."""
+        self.model.eval()
+        save_dir = os.path.join("samples", self.model_name)
+        os.makedirs(save_dir, exist_ok=True)
+        images = []
+        count = 0
+        with torch.no_grad():
+            for batch in self.val_loader:
+                if count >= 4:
+                    break
+                thermal = batch['thermal'].to(self.device)
+                visible = batch['visible'].to(self.device)
+                with autocast('cuda', enabled=self.use_amp):
+                    if self.model_name == "Cond-DDPM":
+                        pred = self.model.sample_ddim(thermal, shape=(thermal.shape[0], 3, thermal.shape[2], thermal.shape[3]), ddim_steps=50)
+                    elif self.model_name == "FWGAN":
+                        pred = self.model.forward_generate(thermal)
+                    elif self.model_name == "VQ-InfraTrans":
+                        pred, _, _ = self.model(thermal)
+                    elif self.model_name == "DCNet":
+                        pred = self.model(thermal, extract_features=False)
+                    else:
+                        pred = self.model(thermal)
+                # Take first image from batch
+                t_img = (thermal[0].cpu() + 1) / 2  # (1, H, W) -> [0,1]
+                t_img = t_img.repeat(3, 1, 1)       # grayscale to 3ch
+                p_img = (pred[0].cpu().float() + 1) / 2
+                v_img = (visible[0].cpu() + 1) / 2
+                images.extend([t_img.clamp(0,1), p_img.clamp(0,1), v_img.clamp(0,1)])
+                count += 1
+        if images:
+            grid = make_grid(images, nrow=3, padding=2)
+            save_image(grid, os.path.join(save_dir, f"epoch_{epoch:02d}.png"))
+
+
+# --------------------------------------------------------------------------- #
+# Entry point
+# --------------------------------------------------------------------------- #
+
+if __name__ == '__main__':
+    print("Initiating Unified Generative Framework Training Orchestrator...")
+
+    # Allow overriding paths via environment variables so Colab users can
+    # point at a Drive-mounted dataset / persistent checkpoint dir without
+    # editing source. Example in a Colab cell:
+    #   %env LLVIP_ROOT=/content/drive/MyDrive/LLVIP
+    #   %env CKPT_DIR=/content/drive/MyDrive/checkpoints
+    LLVIP_ROOT   = os.environ.get("LLVIP_ROOT",
+                                   os.path.join("data", "LLVIP", "LLVIP"))
+    THERMAL_DIR  = os.environ.get("THERMAL_DIR",
+                                   os.path.join(LLVIP_ROOT, "infrared"))
+    VISIBLE_DIR  = os.environ.get("VISIBLE_DIR",
+                                   os.path.join(LLVIP_ROOT, "visible"))
+    RESULTS_PATH = os.environ.get("RESULTS_PATH", "results.json")
+    CKPT_DIR     = os.environ.get("CKPT_DIR", "checkpoints")
+
+    # Comma-separated list of model names to force-skip regardless of checkpoints.
+    # Example: %env SKIP_MODELS=FWGAN   or   %env SKIP_MODELS=FWGAN,DCNet
+    _skip_env  = os.environ.get("SKIP_MODELS", "")
+    SKIP_MODELS = {s.strip() for s in _skip_env.split(",") if s.strip()}
+
+    # Optional: raise the epoch CAP (early stopping decides the real stop point)
+    # and tune patience. e.g.  %env EPOCHS=150   %env PATIENCE=12
+    EPOCHS_OVERRIDE = os.environ.get("EPOCHS")
+    PATIENCE        = int(os.environ.get("PATIENCE", "10"))
+
+    if not os.path.exists(THERMAL_DIR) or not os.path.exists(VISIBLE_DIR):
+        print(f"Error: Dataset paths missing.\n"
+              f"  Thermal : {THERMAL_DIR}\n"
+              f"  Visible : {VISIBLE_DIR}")
+        exit(1)
+
+    os.makedirs(CKPT_DIR, exist_ok=True)
+
+    # Load any results already saved from a previous run
+    if os.path.exists(RESULTS_PATH):
+        with open(RESULTS_PATH, "r", encoding="utf-8") as f:
+            benchmark_results = json.load(f)
+        print(f"Loaded existing results for: {list(benchmark_results.keys())}")
+    else:
+        benchmark_results = {}
+
+    # Batch sizes for Colab A100 (40 GB VRAM) with AMP (fp16).
+    #
+    # DCNet:  2x generator forward + VGG activations peak at ~22GB for batch 64.
+    #         With the torch.no_grad() fix on the 2nd pass, batch 32 is safe (~11GB).
+    # FWGAN:  Gen and disc run in separate backward passes — peak = one pass at a time.
+    #         Batch 128 tested and worked previously.
+    # VQ-InfraTrans: Transformer attention (B,8,1024,1024) × 6 layers = B×96MB.
+    #         Batch 64 ≈ 6GB for attention alone; 120 was borderline but worked.
+    # Inter-Mamba: SSM intermediate (B,4096,512,16) = B×64MB; batch 32 ≈ 2GB.
+    # Cond-DDPM: UNet bottleneck at 32×32 resolution — lighter than it looks.
+    model_configs = {
+        "DCNet":         {"batch_size": 32,  "epochs": 50},
+        "FWGAN":         {"batch_size": 128, "epochs": 50},
+        "VQ-InfraTrans": {"batch_size": 156, "epochs": 50},
+        "Inter-Mamba":   {"batch_size": 48,  "epochs": 50},
+        "Cond-DDPM":     {"batch_size": 32,  "epochs": 50},
+    }
+
+    for model_name, config in model_configs.items():
+        ckpt_path = os.path.join(CKPT_DIR, f"{model_name}_final.pth")
+
+        if model_name in SKIP_MODELS:
+            print(f"\n[SKIP] {model_name} — force-skipped via SKIP_MODELS env var.")
+            continue
+
+        trainer = UnifiedModelTrainer(
+            model_name=model_name,
+            thermal_dir=THERMAL_DIR,
+            visible_dir=VISIBLE_DIR,
+            batch_size=config["batch_size"],
+            epochs=int(EPOCHS_OVERRIDE) if EPOCHS_OVERRIDE else config["epochs"],
+            device="cuda" if torch.cuda.is_available() else "cpu",
+            ckpt_dir=CKPT_DIR,
+            patience=PATIENCE,
+        )
+
+        if os.path.exists(ckpt_path) and model_name in benchmark_results:
+            # Checkpoint AND results both exist — skip entirely
+            print(f"\n[SKIP] {model_name} — checkpoint and results already saved. "
+                  f"Delete '{ckpt_path}' to force a retrain.")
+            continue
+
+        elif os.path.exists(ckpt_path) and model_name not in benchmark_results:
+            # Checkpoint exists but JSON entry is missing — training completed
+            # but the run crashed before writing results. Recover by loading
+            # weights and running one validation pass instead of retraining.
+            print(f"\n[RECOVER] {model_name} — checkpoint found but no JSON entry. "
+                  f"Loading weights and running validation to recover metrics...")
+            trainer.load_checkpoint(ckpt_path)
+            history = trainer.run_validation_only()
+
+        else:
+            # No checkpoint — train from scratch
+            print(f"\n{'='*50}\nStarting Automated Pipeline for: {model_name}\n{'='*50}")
+            history = trainer.run_training_loop()
+
+        benchmark_results[model_name] = history
+
+        # Write after every model so a crash mid-run loses nothing
+        with open(RESULTS_PATH, "w", encoding="utf-8") as f:
+            json.dump(benchmark_results, f, indent=4)
+        print(f"[SAVED] '{model_name}' results written to '{RESULTS_PATH}'.")
+
+        # Free GPU memory before mounting the next architecture.
+        del trainer
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    print("\nAll architecture benchmark loops complete.")
+    print(f"Final metrics in '{RESULTS_PATH}'.")
+
+    # Generate final comparison grid
+    print("Generating final comparison grid...")
+    os.makedirs("samples", exist_ok=True)
+    comparison_images = []
+    # Get 6 test images
+    _grid_split = resolve_official_splits(THERMAL_DIR, VISIBLE_DIR)
+    if _grid_split is not None:
+        (_gva_t, _gva_v) = _grid_split[1]      # official test set
+        test_loader = create_dataloader(_gva_t, _gva_v, mode="paired",
+                                        is_train=False, batch_size=1, split_ratio=None)
+    else:
+        test_loader = create_dataloader(THERMAL_DIR, VISIBLE_DIR, mode="paired",
+                                        is_train=False, batch_size=1)
+    test_samples = []
+    for i, batch in enumerate(test_loader):
+        if i >= 6:
+            break
+        test_samples.append(batch)
+
+    model_names_ordered = ["DCNet", "FWGAN", "VQ-InfraTrans", "Inter-Mamba", "Cond-DDPM"]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    for sample in test_samples:
+        thermal = sample['thermal'].to(device)
+        visible = sample['visible'].to(device)
+        row = [(thermal[0].cpu() + 1) / 2]
+        row[0] = row[0].repeat(3, 1, 1) if row[0].shape[0] == 1 else row[0]
+
+        for mn in model_names_ordered:
+            ckpt = os.path.join(CKPT_DIR, f"{mn}_final.pth")
+            if not os.path.exists(ckpt):
+                row.append(torch.zeros(3, 256, 256))
+                continue
+            # Create a temporary trainer just to load the model
+            tmp = UnifiedModelTrainer(mn, THERMAL_DIR, VISIBLE_DIR, batch_size=1, epochs=1, device="cuda")
+            tmp.load_checkpoint(ckpt)
+            tmp.model.eval()
+            with torch.no_grad(), autocast('cuda', enabled=True):
+                if mn == "Cond-DDPM":
+                    p = tmp.model.sample_ddim(thermal, shape=(1,3,256,256), ddim_steps=50)
+                elif mn == "FWGAN":
+                    p = tmp.model.forward_generate(thermal)
+                elif mn == "VQ-InfraTrans":
+                    p, _, _ = tmp.model(thermal)
+                elif mn == "DCNet":
+                    p = tmp.model(thermal, extract_features=False)
+                else:
+                    p = tmp.model(thermal)
+            row.append((p[0].cpu().float() + 1) / 2)
+            del tmp
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        row.append((visible[0].cpu() + 1) / 2)
+        comparison_images.extend([img.clamp(0, 1) for img in row])
+
+    if comparison_images:
+        grid = make_grid(comparison_images, nrow=7, padding=4)
+        save_image(grid, "samples/final_comparison.png")
+        print("Saved samples/final_comparison.png")

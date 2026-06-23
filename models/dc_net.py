@@ -5,18 +5,27 @@ import torchvision.models as models
 
 
 class ResidualBlock(nn.Module):
-    """Standard residual block with reflection padding and affine InstanceNorm."""
-    def __init__(self, channels):
+    """Standard residual block with reflection padding and affine InstanceNorm.
+
+    Optional dropout for regularization. It is appended at the END of the block
+    so it adds no parameters and never shifts the conv/norm state_dict indices —
+    a dropout>0 model and a dropout=0 model share identical keys, so existing
+    checkpoints still load either way.
+    """
+    def __init__(self, channels, dropout=0.0):
         super(ResidualBlock, self).__init__()
-        self.block = nn.Sequential(
+        layers = [
             nn.ReflectionPad2d(1),
             nn.Conv2d(channels, channels, 3, bias=False),
-            nn.InstanceNorm2d(channels, affine=True),   # FIX: affine=True for learnable scale/shift
+            nn.InstanceNorm2d(channels, affine=True),   # affine=True: learnable scale/shift
             nn.ReLU(inplace=True),
             nn.ReflectionPad2d(1),
             nn.Conv2d(channels, channels, 3, bias=False),
-            nn.InstanceNorm2d(channels, affine=True)    # FIX: affine=True
-        )
+            nn.InstanceNorm2d(channels, affine=True),
+        ]
+        if dropout > 0:
+            layers.append(nn.Dropout(dropout))
+        self.block = nn.Sequential(*layers)
 
     def forward(self, x):
         return x + self.block(x)
@@ -31,7 +40,7 @@ class Generator(nn.Module):
     and not lost in the bottleneck. Encoder/decoder channel sizes are adjusted
     accordingly to account for concatenated skip tensors.
     """
-    def __init__(self, input_nc=1, output_nc=3, ngf=64, n_blocks=9):
+    def __init__(self, input_nc=1, output_nc=3, ngf=64, n_blocks=9, res_dropout=0.0):
         super(Generator, self).__init__()
 
         # ------------------------------------------------------------------ #
@@ -59,7 +68,7 @@ class Generator(nn.Module):
         # ------------------------------------------------------------------ #
         # 2. ResNet bottleneck blocks
         # ------------------------------------------------------------------ #
-        res_blocks = [ResidualBlock(ngf * 4) for _ in range(n_blocks)]
+        res_blocks = [ResidualBlock(ngf * 4, dropout=res_dropout) for _ in range(n_blocks)]
         self.res_blocks = nn.Sequential(*res_blocks)
         # output: (B, 256, H/4, W/4)
 
@@ -201,6 +210,36 @@ class PerceptualContrastiveBranch(nn.Module):
         return [h1, h2, h3, h4, h5]
 
 
+class NLayerDiscriminator(nn.Module):
+    """Conditional 70x70 PatchGAN discriminator (pix2pix-style).
+
+    Sees the INPUT and OUTPUT together: concat([thermal(1ch), visible(3ch)]) so
+    it judges whether a visible image is a plausible translation OF THIS thermal
+    frame, not just a plausible visible image. Output is a map of real/fake
+    logits (one per ~70x70 receptive patch); use with an LSGAN (MSE) objective.
+    """
+    def __init__(self, input_nc=4, ndf=64, n_layers=3):
+        super(NLayerDiscriminator, self).__init__()
+        kw, padw = 4, 1
+        layers = [nn.Conv2d(input_nc, ndf, kw, stride=2, padding=padw),
+                  nn.LeakyReLU(0.2, inplace=True)]
+        nf_mult = 1
+        for n in range(1, n_layers):                       # progressively downsample
+            nf_prev, nf_mult = nf_mult, min(2 ** n, 8)
+            layers += [nn.Conv2d(ndf * nf_prev, ndf * nf_mult, kw, stride=2, padding=padw, bias=False),
+                       nn.InstanceNorm2d(ndf * nf_mult, affine=True),
+                       nn.LeakyReLU(0.2, inplace=True)]
+        nf_prev, nf_mult = nf_mult, min(2 ** n_layers, 8)
+        layers += [nn.Conv2d(ndf * nf_prev, ndf * nf_mult, kw, stride=1, padding=padw, bias=False),
+                   nn.InstanceNorm2d(ndf * nf_mult, affine=True),
+                   nn.LeakyReLU(0.2, inplace=True),
+                   nn.Conv2d(ndf * nf_mult, 1, kw, stride=1, padding=padw)]
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.model(x)
+
+
 class DCNet(nn.Module):
     """
     DC-Net (Dual-Branch Colorization Network)
@@ -230,9 +269,10 @@ class DCNet(nn.Module):
         # then compute PatchNCE between src_proj and gen_proj
     """
 
-    def __init__(self, input_nc=1, output_nc=3):
+    def __init__(self, input_nc=1, output_nc=3, res_dropout=0.0):
         super(DCNet, self).__init__()
-        self.generator           = Generator(input_nc=input_nc, output_nc=output_nc)
+        self.generator           = Generator(input_nc=input_nc, output_nc=output_nc,
+                                             res_dropout=res_dropout)
         self.patch_guidance      = PatchContrastiveBranch()
         self.perceptual_guidance = PerceptualContrastiveBranch(requires_grad=False)
 

@@ -34,10 +34,17 @@ class ThermalVisibleDataset(Dataset):
         if mode == "paired":
             assert len(all_thermal) == len(all_visible), \
                 f"Paired mode: {len(all_thermal)} thermal vs {len(all_visible)} visible"
-        split = int(len(all_thermal) * split_ratio)
-        split_v = int(len(all_visible) * split_ratio)
-        self.thermal_paths = all_thermal[:split] if is_train else all_thermal[split:]
-        self.visible_paths = all_visible[:split_v] if is_train else all_visible[split_v:]
+        if split_ratio is None:
+            # Use ALL files in this directory (no internal split). Use this when
+            # train/ and test/ are already separate official folders, so the two
+            # splits can never leak into one another via a shared ratio slice.
+            self.thermal_paths = all_thermal
+            self.visible_paths = all_visible
+        else:
+            split = int(len(all_thermal) * split_ratio)
+            split_v = int(len(all_visible) * split_ratio)
+            self.thermal_paths = all_thermal[:split] if is_train else all_thermal[split:]
+            self.visible_paths = all_visible[:split_v] if is_train else all_visible[split_v:]
         self.mode = mode
         self.is_train = is_train
         self.img_size = img_size
@@ -67,6 +74,11 @@ class ThermalVisibleDataset(Dataset):
             if random.random() > 0.5:
                 thermal_img = TF.hflip(thermal_img)
                 visible_img = TF.hflip(visible_img)
+            # Thermal-ONLY photometric jitter: improves robustness to unseen
+            # thermal intensity/contrast distributions. Applied only to the input
+            # so the visible ground truth is never altered.
+            thermal_img = TF.adjust_brightness(thermal_img, 1.0 + random.uniform(-0.2, 0.2))
+            thermal_img = TF.adjust_contrast(thermal_img,   1.0 + random.uniform(-0.2, 0.2))
         else:
             thermal_img = TF.resize(thermal_img, self.img_size, TF.InterpolationMode.BICUBIC)
             visible_img = TF.resize(visible_img, self.img_size, TF.InterpolationMode.BICUBIC)

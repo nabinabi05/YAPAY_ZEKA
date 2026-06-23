@@ -177,6 +177,7 @@ class PatchNCELoss(nn.Module):
         self.ce = nn.CrossEntropyLoss()
 
     def forward(self, q, k):                                      # q,k: (B, P, C)
+        q, k = q.float(), k.float()                               # fp32: -1e9 mask overflows fp16 under AMP
         B, P, _ = q.shape
         l_pos = (q * k).sum(dim=-1, keepdim=True)                 # (B,P,1)
         l_neg = torch.bmm(q, k.transpose(1, 2))                   # (B,P,P) within-image
@@ -228,7 +229,7 @@ def perceptual_contrastive_loss(vgg, fake, visible, infrared, t=1e-7):
         kshuf = kpos.flatten(2)[:, :, idx].view(B, C, H, W)       # non-corresponding visible
         pos = (q - kpos).abs().mean()
         neg = 0.5 * ((q - kneg).abs().mean() + (q - kshuf).abs().mean())
-        loss = loss + pos / (neg + t)
+        loss = loss + pos.float() / (neg.float() + t)             # fp32: t=1e-7 underflows to 0 in fp16
     return loss
 
 
@@ -345,8 +346,8 @@ def main():
     optG = torch.optim.Adam(G.parameters(),   lr=a.lr, betas=(0.5, 0.999))
     optD = torch.optim.Adam(D.parameters(),   lr=a.lr, betas=(0.5, 0.999))
     optF = torch.optim.Adam(Fnet.parameters(), lr=a.lr, betas=(0.5, 0.999))
-    scaler = torch.cuda.amp.GradScaler(enabled=a.amp)
-    autocast = lambda: torch.cuda.amp.autocast(enabled=a.amp)
+    scaler = torch.amp.GradScaler('cuda', enabled=a.amp)
+    autocast = lambda: torch.amp.autocast('cuda', enabled=a.amp)
 
     best_ssim, best_epoch, no_improve = -1.0, 0, 0
     best_path = os.path.join(a.ckpt_dir, "DCNet_paper_best.pth")

@@ -89,6 +89,3 @@ If a Colab session disconnects mid-run, just re-run the script: completed models
 - `checkpoints/`: (Ignored) Model weights are saved here after training.
 - `samples/`: (Ignored) Visual comparison grids.
 
-## License
-
-[Add License Here]
